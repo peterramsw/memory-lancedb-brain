@@ -1,11 +1,13 @@
 /**
  * memory-lancedb-brain - OpenClaw intelligent memory plugin
- * Phase 1 skeleton only: config loading + LanceDB connect + embedder init
+ * Phase 2: initialization + tool registration
  */
 
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
-import { connectDb, ensureTables } from "./src/storage.js";
+import { MemoryStorage } from "./src/storage.js";
 import { createEmbedder, type EmbeddingConfig } from "./src/embedding.js";
+import { normalizeOwners } from "./src/owners.js";
+import { registerAllMemoryTools } from "./src/tools.js";
 
 interface PluginConfig {
   embedding?: {
@@ -18,21 +20,20 @@ interface PluginConfig {
   owners?: Array<{
     owner_id: string;
     owner_namespace: string;
-    channels?: string[];
+    channels?: Record<string, string>;
   }>;
   agentWhitelist?: string[];
   retrieval?: {
-    mode?: string;
+    mode?: "hybrid" | "vector" | "keyword";
     vectorWeight?: number;
     bm25Weight?: number;
     minScore?: number;
+    hardMinScore?: number;
     rerank?: boolean;
     rerankApiKey?: string;
     rerankModel?: string;
     rerankEndpoint?: string;
-    rerankProvider?: string;
     candidatePoolSize?: number;
-    hardMinScore?: number;
   };
   distillation?: {
     model?: string;
@@ -48,29 +49,50 @@ const DEFAULT_EMBEDDING: Required<EmbeddingConfig> = {
   dimensions: 2560,
 };
 
-export default function register(api: OpenClawPluginApi): void {
+const DEFAULT_WHITELIST = [
+  "main",
+  "gb10-deploy",
+  "peter-365",
+  "plaw-coding-team",
+  "tiffany-ops",
+  "gb10-openclaw-pr-reviewer",
+];
+
+export default function register(api: OpenClawPluginApi & { logger?: any; pluginConfig?: unknown }): void {
   void (async () => {
     try {
-      const config = (api.config ?? {}) as PluginConfig;
-      const dbPath = config.dbPath ?? ".openclaw-memory-lancedb-brain";
+      const config = ((api.pluginConfig ?? api.config ?? {}) as PluginConfig) ?? {};
+      const dbPath = api.resolvePath?.(config.dbPath ?? "./data/memory-lancedb-brain") ?? (config.dbPath ?? "./data/memory-lancedb-brain");
       const embeddingConfig: EmbeddingConfig = {
         ...DEFAULT_EMBEDDING,
         ...(config.embedding ?? {}),
       };
 
-      const db = await connectDb(dbPath);
-      await ensureTables(db);
+      const storage = await MemoryStorage.connect(dbPath);
       const embedder = createEmbedder(embeddingConfig);
+      const owners = normalizeOwners(config.owners);
+      const agentWhitelist = config.agentWhitelist ?? DEFAULT_WHITELIST;
+
+      registerAllMemoryTools(api, {
+        storage,
+        embedder,
+        owners,
+        agentWhitelist,
+        retrieval: config.retrieval,
+      });
 
       (api as any).__memoryLanceDbBrain = {
-        db,
+        storage,
         embedder,
+        owners,
+        agentWhitelist,
         config,
       };
 
-      api.log.info("memory-lancedb-brain: Phase 1 initialized");
+      api.logger?.info?.(`memory-lancedb-brain: Phase 2 initialized (db=${dbPath})`);
     } catch (error) {
-      api.log.error(`memory-lancedb-brain: Phase 1 initialization failed: ${String(error)}`);
+      api.logger?.error?.(`memory-lancedb-brain: initialization failed: ${String(error)}`);
+      throw error;
     }
   })();
 }

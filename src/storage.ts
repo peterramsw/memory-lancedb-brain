@@ -4,12 +4,15 @@
 
 import type { Connection, Table } from "@lancedb/lancedb";
 import * as lancedb from "@lancedb/lancedb";
-import type { MemoryEventRecord, MemoryRecord, MemoryScope, MemoryStatus } from "./schema.js";
+import type { MemoryEventRecord, MemoryRecord, MemoryScope, MemoryStatus, MemoryType } from "./schema.js";
 
 export interface MemoryFilters {
+  memory_id?: string;
   owner_id?: string;
+  owner_namespace?: string;
   agent_id?: string;
   memory_scope?: MemoryScope;
+  memory_type?: MemoryType;
   status?: MemoryStatus;
 }
 
@@ -26,10 +29,15 @@ function buildWhereClause(filters?: MemoryFilters): string | null {
   if (!filters) return null;
 
   const conditions: string[] = [];
+  if (filters.memory_id) conditions.push(`memory_id = '${escapeSqlLiteral(filters.memory_id)}'`);
   if (filters.owner_id) conditions.push(`owner_id = '${escapeSqlLiteral(filters.owner_id)}'`);
+  if (filters.owner_namespace) conditions.push(`owner_namespace = '${escapeSqlLiteral(filters.owner_namespace)}'`);
   if (filters.agent_id) conditions.push(`agent_id = '${escapeSqlLiteral(filters.agent_id)}'`);
   if (filters.memory_scope) {
     conditions.push(`memory_scope = '${escapeSqlLiteral(filters.memory_scope)}'`);
+  }
+  if (filters.memory_type) {
+    conditions.push(`memory_type = '${escapeSqlLiteral(filters.memory_type)}'`);
   }
   if (filters.status) conditions.push(`status = '${escapeSqlLiteral(filters.status)}'`);
 
