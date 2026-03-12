@@ -28,5 +28,6 @@ declare module "openclaw/plugin-sdk" {
     registerTool?(tool: unknown, opts?: unknown): void;
     registerCommand?(command: unknown): void;
     registerContextEngine?(id: string, factory: unknown): void;
+    on?(hookName: string, handler: (...args: unknown[]) => unknown, opts?: unknown): void;
   }
 }

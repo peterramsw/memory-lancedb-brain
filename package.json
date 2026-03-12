@@ -25,7 +25,7 @@
     ]
   },
   "scripts": {
-    "test": "tsx test/phase1-smoke.mjs && tsx test/phase2-tools.mjs",
+    "test": "tsx test/phase1-smoke.mjs && tsx test/phase2-tools.mjs && tsx test/phase3-context.mjs",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
