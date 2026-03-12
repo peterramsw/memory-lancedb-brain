@@ -9,6 +9,8 @@ import type { MemoryStorage } from "./storage.js";
 import type { OwnerConfig, ResolvedOwner } from "./owners.js";
 import { hybridRetrieve, generateSummary, generateTitle } from "./retrieval.js";
 import type { DistillOutput } from "./distill.js";
+import { buildCandidateMemories, processLifecycle } from "./lifecycle.js";
+import type { Embedder } from "./embedding.js";
 
 export interface AgentMessageLike {
   role?: string;
@@ -35,7 +37,7 @@ export interface SessionState {
 
 export interface ContextEngineDeps {
   storage: MemoryStorage;
-  embedder: { embed(text: string): Promise<number[]> };
+  embedder: Embedder;
   distiller: { distillTranscript(transcript: string, opts?: { customInstructions?: string }): Promise<DistillOutput> };
   owners: OwnerConfig[];
   agentWhitelist: string[];
@@ -251,68 +253,53 @@ async function persistDistilledMemories(
   deps: ContextEngineDeps,
   session: SessionState,
   distilled: DistillOutput,
-): Promise<{ insertedCount: number; firstMemoryId?: string; insertedTypes: string[] }> {
+): Promise<{
+  insertedCount: number;
+  mergedCount: number;
+  supersedeCandidates: number;
+  archivedCount: number;
+  firstMemoryId?: string;
+  insertedTypes: string[];
+}> {
   const owner = resolveOwnerForSession(deps, session);
-  if (!owner) return { insertedCount: 0, insertedTypes: [] };
+  if (!owner) return { insertedCount: 0, mergedCount: 0, supersedeCandidates: 0, archivedCount: 0, insertedTypes: [] };
 
-  const now = Date.now();
-  const items: Array<{ type: MemoryType; text: string; scope?: MemoryScope }> = [];
+  // Build candidate memories from distill output using lifecycle
+  const candidates = await buildCandidateMemories(
+    { storage: deps.storage, embedder: deps.embedder },
+    {
+      sessionId: session.sessionId,
+      ownerId: owner.ownerId,
+      ownerNamespace: owner.ownerNamespace,
+      agentId: session.agentId,
+    },
+    distilled,
+    Date.now(),
+  );
 
-  if (distilled.session_summary) items.push({ type: "summary", text: distilled.session_summary });
-  for (const text of distilled.confirmed_facts) items.push({ type: "fact", text });
-  for (const text of distilled.decisions) items.push({ type: "decision", text });
-  for (const text of distilled.pitfalls) items.push({ type: "pitfall", text });
-  for (const text of distilled.preference_updates) items.push({ type: "preference", text });
-  for (const text of distilled.environment_truths) items.push({ type: "fact", text });
-  for (const text of distilled.open_loops) items.push({ type: "todo", text, scope: distilled.scope_recommendation === "both" ? "agent_local" : undefined });
-
-  let firstMemoryId: string | undefined;
-  const insertedTypes: string[] = [];
-  let insertedCount = 0;
-
-  for (const item of items) {
-    const text = item.text.trim();
-    if (!text) continue;
-    const memoryScope = item.scope ?? normalizeScopeRecommendation(distilled.scope_recommendation, item.type);
-    const record: MemoryRecord = {
-      memory_id: randomUUID(),
-      owner_namespace: owner.ownerNamespace,
-      owner_id: owner.ownerId,
-      agent_id: session.agentId ?? "unknown-agent",
-      memory_scope: memoryScope,
-      memory_type: item.type,
-      title: generateTitle(text),
-      content: text,
-      summary: generateSummary(text),
-      tags: JSON.stringify(["distilled", `session:${session.sessionId}`]),
-      importance: item.type === "summary" ? 4 : 3,
-      confidence: 0.8,
-      status: "active",
-      supersedes_id: "",
-      created_at: now,
-      updated_at: now,
-      last_used_at: now,
-      source_session_id: session.sessionId,
-      embedding: await deps.embedder.embed(text),
-    };
-    await deps.storage.insertMemory(record);
-    await deps.storage.insertEvent({
-      event_id: randomUUID(),
-      memory_id: record.memory_id,
-      event_type: "distill",
-      event_time: now,
-      details_json: JSON.stringify({
-        sessionId: session.sessionId,
-        scope_recommendation: distilled.scope_recommendation,
-        memory_type: item.type,
-      }),
-    });
-    if (!firstMemoryId) firstMemoryId = record.memory_id;
-    insertedTypes.push(item.type);
-    insertedCount += 1;
+  if (candidates.length === 0) {
+    return { insertedCount: 0, mergedCount: 0, supersedeCandidates: 0, archivedCount: 0, insertedTypes: [] };
   }
 
-  return { insertedCount, firstMemoryId, insertedTypes };
+  // Process through lifecycle (merge / supersede detection / insert)
+  const lifecycleResult = await processLifecycle(
+    { storage: deps.storage, embedder: deps.embedder },
+    candidates,
+    { threshold: 0.92 },       // merge threshold
+    { similarityThreshold: 0.80 }, // supersede candidate threshold
+    { maxImportance: 1, daysInactive: 90 }, // archive config
+  );
+
+  const insertedTypes = candidates.map((c) => c.memory_type);
+
+  return {
+    insertedCount: lifecycleResult.inserted,
+    mergedCount: lifecycleResult.merged,
+    supersedeCandidates: lifecycleResult.supersedeCandidates,
+    archivedCount: lifecycleResult.archived,
+    firstMemoryId: lifecycleResult.firstMemoryId,
+    insertedTypes,
+  };
 }
 
 export async function compactSession(
@@ -339,13 +326,32 @@ export async function compactSession(
     customInstructions: params.customInstructions,
   });
   const persisted = await persistDistilledMemories(deps, session, distilled);
+
+  if (persisted.firstMemoryId) {
+    await deps.storage.insertEvent({
+      event_id: randomUUID(),
+      memory_id: persisted.firstMemoryId,
+      event_type: "distill",
+      event_time: Date.now(),
+      details_json: JSON.stringify({
+        sessionId: session.sessionId,
+        summary: distilled.session_summary,
+        scope_recommendation: distilled.scope_recommendation,
+        insertedCount: persisted.insertedCount,
+        mergedCount: persisted.mergedCount,
+        supersedeCandidates: persisted.supersedeCandidates,
+        archivedCount: persisted.archivedCount,
+      }),
+    });
+  }
+
   session.staging = [];
   session.updatedAt = Date.now();
   deps.sessionStates.set(session.sessionId, session);
 
   return {
     ok: true,
-    compacted: persisted.insertedCount > 0,
+    compacted: persisted.insertedCount + persisted.mergedCount > 0,
     result: {
       summary: distilled.session_summary,
       firstKeptEntryId: persisted.firstMemoryId,
@@ -353,6 +359,9 @@ export async function compactSession(
       tokensAfter: Math.max(estimateTokens(distilled.session_summary), 1),
       details: {
         insertedCount: persisted.insertedCount,
+        mergedCount: persisted.mergedCount,
+        supersedeCandidates: persisted.supersedeCandidates,
+        archivedCount: persisted.archivedCount,
         insertedTypes: persisted.insertedTypes,
         scopeRecommendation: distilled.scope_recommendation,
       },
