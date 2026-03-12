@@ -1,0 +1,66 @@
+{
+  "id": "memory-lancedb-brain",
+  "name": "Memory (LanceDB Brain)",
+  "kind": "memory",
+  "version": "0.1.0",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "embedding": {
+        "type": "object",
+        "properties": {
+          "apiKey": { "type": "string" },
+          "model": { "type": "string" },
+          "baseURL": { "type": "string" },
+          "dimensions": { "type": "number" }
+        },
+        "required": ["apiKey", "model", "baseURL"]
+      },
+      "dbPath": { "type": "string" },
+      "owners": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "owner_id": { "type": "string" },
+            "owner_namespace": { "type": "string" },
+            "channels": {
+              "type": "object",
+              "additionalProperties": { "type": "string" }
+            }
+          },
+          "required": ["owner_id", "owner_namespace"]
+        }
+      },
+      "agentWhitelist": {
+        "type": "array",
+        "items": { "type": "string" }
+      },
+      "retrieval": {
+        "type": "object",
+        "properties": {
+          "mode": { "type": "string" },
+          "vectorWeight": { "type": "number" },
+          "bm25Weight": { "type": "number" },
+          "minScore": { "type": "number" },
+          "rerank": { "type": "boolean" },
+          "rerankApiKey": { "type": "string" },
+          "rerankModel": { "type": "string" },
+          "rerankEndpoint": { "type": "string" },
+          "rerankProvider": { "type": "string" },
+          "candidatePoolSize": { "type": "number" },
+          "hardMinScore": { "type": "number" }
+        }
+      },
+      "distillation": {
+        "type": "object",
+        "properties": {
+          "model": { "type": "string" },
+          "baseURL": { "type": "string" },
+          "apiKey": { "type": "string" }
+        }
+      }
+    },
+    "required": ["embedding", "dbPath", "owners"]
+  }
+}

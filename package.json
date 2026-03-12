@@ -1,0 +1,35 @@
+{
+  "name": "memory-lancedb-brain",
+  "version": "0.1.0",
+  "description": "OpenClaw intelligent memory plugin with structured distillation, lifecycle management, and owner-centric memory boundaries",
+  "type": "module",
+  "main": "index.ts",
+  "keywords": [
+    "openclaw",
+    "openclaw-plugin",
+    "memory",
+    "lancedb",
+    "distillation",
+    "lifecycle",
+    "ai-memory"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@lancedb/lancedb": "^0.26.2",
+    "openai": "^6.21.0",
+    "uuid": "^11.1.0"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "tsx test/phase1-smoke.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}
