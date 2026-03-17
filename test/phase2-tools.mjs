@@ -29,7 +29,7 @@ function createRuntime(agentId = "main") {
     sessionId: `session-${randomUUID()}`,
     sessionKey: `session-${randomUUID()}`,
     messageChannel: "telegram",
-    requesterSenderId: "6647202606",
+    requesterSenderId: "0000000000",
     senderIsOwner: true,
   };
 }
@@ -70,9 +70,9 @@ test("Phase 2: tool registration count", async () => {
       embedder: createFakeEmbedder(),
       owners: [
         {
-          owner_id: "peter",
+          owner_id: "test-user",
           owner_namespace: "personal",
-          channels: { telegram: "6647202606" },
+          channels: { telegram: "0000000000" },
         },
       ],
       agentWhitelist: ["main", "plaw-coding-team", "tiffany-ops"],
@@ -91,7 +91,7 @@ test("Phase 2: memory_store -> memory_recall round-trip", async () => {
     registerAllMemoryTools(api, {
       storage,
       embedder: createFakeEmbedder(),
-      owners: [{ owner_id: "peter", owner_namespace: "personal", channels: { telegram: "6647202606" } }],
+      owners: [{ owner_id: "test-user", owner_namespace: "personal", channels: { telegram: "0000000000" } }],
       agentWhitelist: ["main", "plaw-coding-team", "tiffany-ops"],
       retrieval: { mode: "hybrid", minScore: 0.1, hardMinScore: 0.05 },
     });
@@ -124,7 +124,7 @@ test("Phase 2: memory_update + list + stats + forget", async () => {
     registerAllMemoryTools(api, {
       storage,
       embedder: createFakeEmbedder(),
-      owners: [{ owner_id: "peter", owner_namespace: "personal", channels: { telegram: "6647202606" } }],
+      owners: [{ owner_id: "test-user", owner_namespace: "personal", channels: { telegram: "0000000000" } }],
       agentWhitelist: ["main", "plaw-coding-team", "tiffany-ops"],
       retrieval: { mode: "hybrid", minScore: 0.1, hardMinScore: 0.05 },
     });
@@ -173,7 +173,7 @@ test("Phase 2: tiffany-customer hard deny for owner_shared", async () => {
     registerAllMemoryTools(api, {
       storage,
       embedder: createFakeEmbedder(),
-      owners: [{ owner_id: "peter", owner_namespace: "personal", channels: { telegram: "6647202606" } }],
+      owners: [{ owner_id: "test-user", owner_namespace: "personal", channels: { telegram: "0000000000" } }],
       agentWhitelist: ["main", "plaw-coding-team", "tiffany-ops"],
       retrieval: { mode: "hybrid" },
     });
@@ -196,7 +196,7 @@ test("Phase 2: recall excludes archived and superseded by default", async () => 
     registerAllMemoryTools(api, {
       storage,
       embedder: createFakeEmbedder(),
-      owners: [{ owner_id: "peter", owner_namespace: "personal", channels: { telegram: "6647202606" } }],
+      owners: [{ owner_id: "test-user", owner_namespace: "personal", channels: { telegram: "0000000000" } }],
       agentWhitelist: ["main", "plaw-coding-team", "tiffany-ops"],
       retrieval: { mode: "hybrid", minScore: 0.1, hardMinScore: 0.05 },
     });
@@ -238,10 +238,10 @@ test("Phase 2: recall excludes archived and superseded by default", async () => 
 
 test("Phase 2: owner mapping helper + whitelist helper", async () => {
   const owner = resolveOwnerFromContext(
-    { senderId: "6647202606", messageChannel: "telegram", agentId: "main", senderIsOwner: true },
-    [{ owner_id: "peter", owner_namespace: "personal", channels: { telegram: "6647202606" } }],
+    { senderId: "0000000000", messageChannel: "telegram", agentId: "main", senderIsOwner: true },
+    [{ owner_id: "test-user", owner_namespace: "personal", channels: { telegram: "0000000000" } }],
   );
-  assert.deepStrictEqual(owner, { ownerId: "peter", ownerNamespace: "personal" });
+  assert.deepStrictEqual(owner, { ownerId: "test-user", ownerNamespace: "personal" });
   assert.strictEqual(canAccessScope("main", "owner_shared", ["main"]), true);
   assert.strictEqual(canAccessScope("tiffany-customer", "owner_shared", ["tiffany-customer"]), false);
 });

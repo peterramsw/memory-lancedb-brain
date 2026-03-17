@@ -41,14 +41,20 @@ function createDeps(storage, overrides = {}) {
           confirmed_facts: ["Docker runs on GB10"],
           decisions: ["Use memory-lancedb-brain"],
           pitfalls: ["Do not expose owner_shared to tiffany-customer"],
-          preference_updates: ["Peter prefers direct answers"],
+          preference_updates: ["User prefers direct answers"],
           environment_truths: ["OpenClaw is 2026.3.8"],
           open_loops: ["Implement merge lifecycle"],
+          corrections: [],
+          best_practices: [],
+          style_observations: [],
+          expertise_signals: [],
+          active_goals: [],
+          contradictions: [],
           scope_recommendation: "both",
         };
       },
     },
-    owners: [{ owner_id: "peter", owner_namespace: "personal", channels: { telegram: "6647202606" } }],
+    owners: [{ owner_id: "test-user", owner_namespace: "personal", channels: { telegram: "0000000000" } }],
     agentWhitelist: ["main", "plaw-coding-team", "tiffany-ops"],
     retrieval: { mode: "hybrid", minScore: 0.1, hardMinScore: 0.05 },
     sessionStates: new Map(),
@@ -63,7 +69,7 @@ async function insertMemory(storage, partial) {
   await storage.insertMemory({
     memory_id: randomUUID(),
     owner_namespace: "personal",
-    owner_id: "peter",
+    owner_id: "test-user",
     agent_id: "main",
     memory_scope: "owner_shared",
     memory_type: "fact",
@@ -91,7 +97,7 @@ test("Phase 3: registerContextEngine + registerCommand from plugin entry", async
     const api = {
       pluginConfig: {
         dbPath,
-        owners: [{ owner_id: "peter", owner_namespace: "personal", channels: { telegram: "6647202606" } }],
+        owners: [{ owner_id: "test-user", owner_namespace: "personal", channels: { telegram: "0000000000" } }],
       },
       resolvePath(input) { return input; },
       registerTool() { registrations.tools += 1; },
@@ -135,10 +141,10 @@ test("Phase 3: assemble injects owner_shared and agent_local memories", async ()
       sessionId: "s1",
       sessionKey: "key-s1",
       agentId: "main",
-      owner: { ownerId: "peter", ownerNamespace: "personal" },
+      owner: { ownerId: "test-user", ownerNamespace: "personal" },
       channelId: "telegram",
       sessionFile: undefined,
-      staging: ["Docker on GB10"],
+      staging: ["Docker deployment on GB10 infrastructure?"],
       childSessionKeys: [],
       updatedAt: Date.now(),
     });
@@ -193,8 +199,8 @@ test("Phase 3: compact writes distilled memories and /memory distill triggers be
     await writeFile(
       sessionFile,
       [
-        JSON.stringify({ role: "user", content: "Docker runs on GB10." }),
-        JSON.stringify({ role: "assistant", content: "We decided to use memory-lancedb-brain." }),
+        JSON.stringify({ type: "message", message: { role: "user", content: "Docker runs on GB10. The deployment uses memory-lancedb-brain as the primary memory plugin." } }),
+        JSON.stringify({ type: "message", message: { role: "assistant", content: "We decided to use memory-lancedb-brain for long-term memory storage and retrieval." } }),
       ].join("\n"),
       "utf8",
     );
@@ -204,10 +210,10 @@ test("Phase 3: compact writes distilled memories and /memory distill triggers be
       sessionId: "s3",
       sessionKey: "key-s3",
       agentId: "main",
-      owner: { ownerId: "peter", ownerNamespace: "personal" },
+      owner: { ownerId: "test-user", ownerNamespace: "personal" },
       channelId: "telegram",
       sessionFile,
-      staging: ["Peter prefers direct answers"],
+      staging: ["User prefers direct answers"],
       childSessionKeys: [],
       updatedAt: Date.now(),
     });
@@ -218,7 +224,7 @@ test("Phase 3: compact writes distilled memories and /memory distill triggers be
     assert.strictEqual(compactResult.ok, true);
     assert.strictEqual(compactResult.compacted, true);
 
-    const rowsAfterCompact = await storage.queryMemoriesByFilter({ owner_id: "peter" });
+    const rowsAfterCompact = await storage.queryMemoriesByFilter({ owner_id: "test-user" });
     assert.ok(rowsAfterCompact.length >= 5);
 
     const command = createMemoryDistillCommand(deps, engine);
@@ -238,7 +244,7 @@ test("Phase 3: prepareSubagentSpawn and onSubagentEnded promote child staging to
       sessionId: "parent-session",
       sessionKey: "parent-key",
       agentId: "main",
-      owner: { ownerId: "peter", ownerNamespace: "personal" },
+      owner: { ownerId: "test-user", ownerNamespace: "personal" },
       channelId: "telegram",
       sessionFile: undefined,
       staging: ["parent memory"],
@@ -261,4 +267,74 @@ test("Phase 3: prepareSubagentSpawn and onSubagentEnded promote child staging to
   } finally {
     await rm(dbPath, { recursive: true, force: true });
   }
+});
+
+test("Phase 3 regression: compact fails closed when session has no owner", async () => {
+  const { dbPath, storage } = await setupStorage();
+  const sessionFile = `/tmp/memory-lancedb-brain-session-${randomUUID()}.jsonl`;
+  try {
+    await writeFile(
+      sessionFile,
+      [
+        JSON.stringify({ type: "message", message: { role: "user", content: "Docker runs on GB10. The deployment uses memory-lancedb-brain as the primary memory plugin." } }),
+        JSON.stringify({ type: "message", message: { role: "assistant", content: "We decided to use memory-lancedb-brain for long-term memory storage and retrieval." } }),
+      ].join("\n"),
+      "utf8",
+    );
+
+    const deps = createDeps(storage);
+    // Session without owner — simulates missing owner context
+    deps.sessionStates.set("no-owner", {
+      sessionId: "no-owner",
+      sessionKey: "key-no-owner",
+      agentId: "main",
+      owner: undefined,
+      channelId: "telegram",
+      sessionFile,
+      staging: [],
+      childSessionKeys: [],
+      updatedAt: Date.now(),
+    });
+
+    const engine = createMemoryBrainContextEngine(deps);
+    const result = await engine.compact({ sessionId: "no-owner", sessionFile, force: true, currentTokenCount: 200 });
+
+    // Must fail-closed: no memories written, clear error
+    assert.strictEqual(result.ok, false, "compact should fail when owner is missing");
+    assert.match(result.reason, /Missing owner context/);
+
+    // Verify no memories were written
+    const allMemories = await storage.queryMemoriesByFilter({});
+    assert.strictEqual(allMemories.length, 0, "No memories should be written without owner context");
+  } finally {
+    await rm(dbPath, { recursive: true, force: true });
+    await rm(sessionFile, { force: true });
+  }
+});
+
+test("Phase 3 regression: no hardcoded personal names in src/ defaults", async () => {
+  const { readdir: readdirAsync, readFile: readFileAsync } = await import("node:fs/promises");
+  const { join: joinPath } = await import("node:path");
+
+  const srcDir = joinPath(import.meta.dirname, "..", "src");
+  const files = await readdirAsync(srcDir);
+  const tsFiles = files.filter(f => f.endsWith(".ts"));
+
+  const personalNamePattern = /(?:["'`])(?:peter|alice|bob|john|jane)(?:["'`])/i;
+  const violations = [];
+
+  for (const file of tsFiles) {
+    const content = await readFileAsync(joinPath(srcDir, file), "utf-8");
+    const lines = content.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      // Skip comments
+      const trimmed = lines[i].trim();
+      if (trimmed.startsWith("//") || trimmed.startsWith("*")) continue;
+      if (personalNamePattern.test(lines[i])) {
+        violations.push(`${file}:${i + 1}: ${lines[i].trim()}`);
+      }
+    }
+  }
+
+  assert.strictEqual(violations.length, 0, `src/ contains hardcoded personal names as defaults:\n${violations.join("\n")}`);
 });

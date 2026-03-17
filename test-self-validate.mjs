@@ -56,7 +56,7 @@ const mockLLMCaller = async (systemPrompt, userPrompt) => {
   }
   if (systemPrompt.includes("profile")) {
     return `## 基本資料 / Identity
-- 用戶名稱: Peter
+- 用戶名稱: sample-user
 
 ## 專長與技能 / Skills & Expertise
 - 精通 C# 和嵌入式系統開發
@@ -208,8 +208,8 @@ await test("consolidateMemories merges related fragments", async () => {
     const embedding = await mockEmbedder.embed(text);
     await storage.insertMemory({
       memory_id: randomUUID(),
-      owner_namespace: "peter",
-      owner_id: "peter",
+      owner_namespace: "test-user",
+      owner_id: "test-user",
       agent_id: "main",
       memory_scope: "owner_shared",
       memory_type: "fact",
@@ -230,7 +230,7 @@ await test("consolidateMemories merges related fragments", async () => {
   }
 
   const before = storage.getActiveMemories().length;
-  const result = await consolidateMemories(deps, mockLLMCaller, "peter", "peter");
+  const result = await consolidateMemories(deps, mockLLMCaller, "test-user", "test-user");
 
   // Consolidation should have created new consolidated memories and archived originals
   assert(result.consolidated > 0 || result.groupsMerged === 0, "Should attempt consolidation or skip if no clusters");
@@ -256,8 +256,8 @@ await test("resolveContradictions supersedes old memory", async () => {
   const oldId = randomUUID();
   await storage.insertMemory({
     memory_id: oldId,
-    owner_namespace: "peter",
-    owner_id: "peter",
+    owner_namespace: "test-user",
+    owner_id: "test-user",
     agent_id: "main",
     memory_scope: "owner_shared",
     memory_type: "fact",
@@ -278,7 +278,7 @@ await test("resolveContradictions supersedes old memory", async () => {
 
   // Resolve contradiction
   const contradictions = ["NEW: 用戶改用 Ubuntu (supersedes OLD: 用戶使用 Windows)"];
-  const { resolved } = await resolveContradictions(deps, contradictions, "peter", "peter");
+  const { resolved } = await resolveContradictions(deps, contradictions, "test-user", "test-user");
 
   assert(resolved > 0, "Should resolve at least 1 contradiction");
   const old = storage.memories.get(oldId);
@@ -299,8 +299,8 @@ await test("applyConfidenceDecay reduces old unused memories", async () => {
   const now = Date.now();
   await storage.insertMemory({
     memory_id: oldId,
-    owner_namespace: "peter",
-    owner_id: "peter",
+    owner_namespace: "test-user",
+    owner_id: "test-user",
     agent_id: "main",
     memory_scope: "owner_shared",
     memory_type: "fact",
@@ -323,8 +323,8 @@ await test("applyConfidenceDecay reduces old unused memories", async () => {
   const recentId = randomUUID();
   await storage.insertMemory({
     memory_id: recentId,
-    owner_namespace: "peter",
-    owner_id: "peter",
+    owner_namespace: "test-user",
+    owner_id: "test-user",
     agent_id: "main",
     memory_scope: "owner_shared",
     memory_type: "fact",
@@ -361,7 +361,7 @@ await test("synthesizeUserProfile creates structured profile", async () => {
 
   // Insert several memories
   const facts = [
-    { type: "fact", content: "用戶名稱是 Peter" },
+    { type: "fact", content: "用戶名稱是 sample-user" },
     { type: "fact", content: "用戶精通 C# 和嵌入式系統" },
     { type: "fact", content: "用戶擁有 GB10 伺服器" },
     { type: "preference", content: "用戶偏好使用 pnpm" },
@@ -371,8 +371,8 @@ await test("synthesizeUserProfile creates structured profile", async () => {
   for (const f of facts) {
     await storage.insertMemory({
       memory_id: randomUUID(),
-      owner_namespace: "peter",
-      owner_id: "peter",
+      owner_namespace: "test-user",
+      owner_id: "test-user",
       agent_id: "main",
       memory_scope: "owner_shared",
       memory_type: f.type,
@@ -392,11 +392,11 @@ await test("synthesizeUserProfile creates structured profile", async () => {
     });
   }
 
-  const result = await synthesizeUserProfile(deps, mockLLMCaller, "peter", "peter");
+  const result = await synthesizeUserProfile(deps, mockLLMCaller, "test-user", "test-user");
 
   assert(result !== null, "Should produce a profile");
   assert(result.profile.includes("##"), "Profile should have markdown headers");
-  assert(result.profile.includes("Peter"), "Profile should mention Peter");
+  assert(result.profile.includes("sample-user"), "Profile should mention sample-user");
 
   // Verify profile stored as high-importance summary
   const profileMem = storage.memories.get(result.profileMemoryId);
@@ -431,8 +431,8 @@ await test("style_observations stored as preferences via buildCandidateMemories"
 
   const candidates = await buildCandidateMemories(deps, {
     sessionId: "test",
-    ownerId: "peter",
-    ownerNamespace: "peter",
+    ownerId: "test-user",
+    ownerNamespace: "test-user",
     agentId: "main",
   }, distilled);
 
@@ -470,8 +470,8 @@ await test("owner_shared memories visible across agents", async () => {
   const memId = randomUUID();
   await storage.insertMemory({
     memory_id: memId,
-    owner_namespace: "peter",
-    owner_id: "peter",
+    owner_namespace: "test-user",
+    owner_id: "test-user",
     agent_id: "main",
     memory_scope: "owner_shared",
     memory_type: "fact",
@@ -505,8 +505,8 @@ await test("agent_local memories NOT visible to other agents", async () => {
 
   await storage.insertMemory({
     memory_id: randomUUID(),
-    owner_namespace: "peter",
-    owner_id: "peter",
+    owner_namespace: "test-user",
+    owner_id: "test-user",
     agent_id: "main",
     memory_scope: "agent_local",
     memory_type: "pitfall",
@@ -561,8 +561,8 @@ await test("expertise_signals stored as facts via buildCandidateMemories", async
 
   const candidates = await buildCandidateMemories(deps, {
     sessionId: "test",
-    ownerId: "peter",
-    ownerNamespace: "peter",
+    ownerId: "test-user",
+    ownerNamespace: "test-user",
   }, distilled);
 
   const expertiseMemory = candidates.find((c) => c.content.includes("C#"));
@@ -597,8 +597,8 @@ await test("active_goals stored as goal type via buildCandidateMemories", async 
 
   const candidates = await buildCandidateMemories(deps, {
     sessionId: "test",
-    ownerId: "peter",
-    ownerNamespace: "peter",
+    ownerId: "test-user",
+    ownerNamespace: "test-user",
   }, distilled);
 
   const goalMemory = candidates.find((c) => c.content.includes("Sherpa-ONNX"));
@@ -634,8 +634,8 @@ await test("full distill → lifecycle pipeline with all new fields", async () =
 
   const candidates = await buildCandidateMemories(deps, {
     sessionId: "integration-test",
-    ownerId: "peter",
-    ownerNamespace: "peter",
+    ownerId: "test-user",
+    ownerNamespace: "test-user",
     agentId: "main",
   }, distilled);
 
@@ -690,7 +690,7 @@ await test("repeated corrections bump importance via merge", async () => {
   };
 
   const cands1 = await buildCandidateMemories(deps, {
-    sessionId: "s1", ownerId: "peter", ownerNamespace: "peter",
+    sessionId: "s1", ownerId: "test-user", ownerNamespace: "test-user",
   }, correction1);
   await processLifecycle(deps, cands1);
 
@@ -700,7 +700,7 @@ await test("repeated corrections bump importance via merge", async () => {
 
   // Same correction again (should merge and bump importance)
   const cands2 = await buildCandidateMemories(deps, {
-    sessionId: "s2", ownerId: "peter", ownerNamespace: "peter",
+    sessionId: "s2", ownerId: "test-user", ownerNamespace: "test-user",
   }, correction1);
   await processLifecycle(deps, cands2);
 

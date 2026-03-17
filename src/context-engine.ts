@@ -233,6 +233,13 @@ async function selectRelevantMemories(
 ): Promise<MemoryRecord[]> {
   try {
     const filters: Record<string, unknown> = { memory_scope: scope as MemoryScope, status: "active" as const };
+    // Owner isolation: only return memories belonging to this session's owner
+    if (session.owner?.ownerId) {
+      filters.owner_id = session.owner.ownerId;
+    }
+    if (session.owner?.ownerNamespace) {
+      filters.owner_namespace = session.owner.ownerNamespace;
+    }
     // agent_local memories should only be visible to the agent that created them
     if (scope === "agent_local" && session.agentId) {
       filters.agent_id = session.agentId;
@@ -357,25 +364,27 @@ async function compactSession(
       customInstructions: params.customInstructions,
     });
 
+    // Fail-closed: refuse to write memories without owner context
+    if (!session?.owner?.ownerId || !session?.owner?.ownerNamespace) {
+      return { ok: false, compacted: false, reason: "Missing owner context — cannot write memories without owner_id and owner_namespace" };
+    }
+
+    const ownerId = session.owner.ownerId;
+    const ownerNamespace = session.owner.ownerNamespace;
+    const agentId = session?.agentId ?? "unknown";
+
     // Item 2: Resolve contradictions before inserting new memories
-    if (distillResult.contradictions.length > 0) {
-      const ownerId2 = session?.owner?.ownerId ?? "peter";
-      const ownerNamespace2 = session?.owner?.ownerNamespace ?? "peter";
+    if ((distillResult.contradictions ?? []).length > 0) {
       const { resolved } = await resolveContradictions(
         { storage: deps.storage, embedder: deps.embedder },
         distillResult.contradictions,
-        ownerId2,
-        ownerNamespace2,
+        ownerId,
+        ownerNamespace,
       );
       if (resolved > 0) {
         console.log(`[memory-lancedb-brain] compactSession: resolved ${resolved} contradictions`);
       }
     }
-
-    // Build candidate memories with proper embeddings via lifecycle.ts
-    const ownerId = session?.owner?.ownerId ?? "peter";
-    const ownerNamespace = session?.owner?.ownerNamespace ?? "peter";
-    const agentId = session?.agentId ?? "unknown";
 
     const candidates = await buildCandidateMemories(
       { storage: deps.storage, embedder: deps.embedder },
@@ -796,10 +805,13 @@ export function createMemoryDistillCommand(
             const targetScope: MemoryScope = session.owner?.ownerNamespace === "agent_local" ? "agent_local" : "owner_shared";
             const now = Date.now();
 
-            // Get agent ID from session or fallback
+            // Fail-closed: refuse to store without owner context
+            if (!session.owner?.ownerId || !session.owner?.ownerNamespace) {
+              return { text: "Missing owner context — cannot store memory without owner_id and owner_namespace.", isError: true };
+            }
             const agentId = session.agentId || "unknown";
-            const ownerId = session.owner?.ownerId || "peter";
-            const ownerNamespace = session.owner?.ownerNamespace || "peter";
+            const ownerId = session.owner.ownerId;
+            const ownerNamespace = session.owner.ownerNamespace;
 
             // Generate embedding so vector search can find this memory
             const embedding = await deps.embedder.embed(subArgs.trim());
@@ -855,8 +867,11 @@ export function createMemoryDistillCommand(
 
           const sessionId5 = deps.lastSessionByChannel.get(ctx.channel) ?? [...deps.sessionStates.keys()].at(-1);
           const session5 = sessionId5 ? deps.sessionStates.get(sessionId5) : undefined;
-          const ownerId5 = session5?.owner?.ownerId ?? "peter";
-          const ownerNamespace5 = session5?.owner?.ownerNamespace ?? "peter";
+          if (!session5?.owner?.ownerId || !session5?.owner?.ownerNamespace) {
+            return { text: "Missing owner context — cannot consolidate without owner_id and owner_namespace." };
+          }
+          const ownerId5 = session5.owner.ownerId;
+          const ownerNamespace5 = session5.owner.ownerNamespace;
 
           try {
             const result = await consolidateMemories(
@@ -883,8 +898,11 @@ export function createMemoryDistillCommand(
 
           const sessionId6 = deps.lastSessionByChannel.get(ctx.channel) ?? [...deps.sessionStates.keys()].at(-1);
           const session6 = sessionId6 ? deps.sessionStates.get(sessionId6) : undefined;
-          const ownerId6 = session6?.owner?.ownerId ?? "peter";
-          const ownerNamespace6 = session6?.owner?.ownerNamespace ?? "peter";
+          if (!session6?.owner?.ownerId || !session6?.owner?.ownerNamespace) {
+            return { text: "Missing owner context — cannot synthesize profile without owner_id and owner_namespace." };
+          }
+          const ownerId6 = session6.owner.ownerId;
+          const ownerNamespace6 = session6.owner.ownerNamespace;
 
           try {
             const result = await synthesizeUserProfile(

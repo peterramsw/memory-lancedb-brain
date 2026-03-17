@@ -128,7 +128,7 @@ Array of owner definitions for multi-tenant memory isolation:
 
 ```json
 [{
-  "owner_id": "peter",
+  "owner_id": "user-1",
   "owner_namespace": "owner_shared",
   "channels": { "telegram:123456": "123456" }
 }]

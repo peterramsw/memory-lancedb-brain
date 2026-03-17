@@ -260,7 +260,7 @@ export default function register(api: OpenClawPluginApi & { logger?: any; plugin
           if (!sessionFile) {
             const agentId = session.agentId ?? "main";
             const candidate = join(
-              process.env.HOME ?? "/home/peter",
+              process.env.HOME ?? "",
               ".openclaw/agents",
               agentId,
               "sessions",
