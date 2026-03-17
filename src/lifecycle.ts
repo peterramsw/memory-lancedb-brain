@@ -93,6 +93,8 @@ export async function buildCandidateMemories(
       scope: distilled.scope_recommendation === "both" ? "agent_local" : undefined,
     });
   }
+  for (const text of (distilled.corrections ?? [])) items.push({ type: "correction", text });
+  for (const text of (distilled.best_practices ?? [])) items.push({ type: "best_practice", text });
 
   const candidates: MemoryRecord[] = [];
   for (const item of items) {
@@ -162,11 +164,13 @@ export async function mergeOrInsertMemory(
       ? kept.content
       : `${kept.content}\n\n[merged]\n${candidate.content}`;
 
+    // Bump importance on merge: recurrence = confidence signal (capped at 5)
+    const bumpedImportance = Math.min(5, Math.max(kept.importance, candidate.importance) + 1);
     await deps.storage.updateMemory(kept.memory_id, {
       content: mergedContent,
       summary: candidate.summary || kept.summary,
-      importance: Math.max(kept.importance, candidate.importance),
-      confidence: Math.max(kept.confidence, candidate.confidence),
+      importance: bumpedImportance,
+      confidence: Math.min(1, Math.max(kept.confidence, candidate.confidence) + 0.05),
       last_used_at: Date.now(),
       updated_at: Date.now(),
     });

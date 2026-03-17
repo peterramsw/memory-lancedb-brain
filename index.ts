@@ -3,6 +3,8 @@
  * Phase 3: tools + context engine + manual distill command
  */
 
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { createDistiller, type DistillerConfig } from "./src/distill.js";
 import {
@@ -14,6 +16,32 @@ import { createEmbedder, type EmbeddingConfig } from "./src/embedding.js";
 import { normalizeOwners, resolveOwnerFromContext } from "./src/owners.js";
 import { MemoryStorage } from "./src/storage.js";
 import { registerAllMemoryTools } from "./src/tools.js";
+
+// Process-global state so duplicate plugin inits share maps, storage, and engine.
+const GLOBAL_STATE_KEY = Symbol.for("memory-lancedb-brain.sessionState");
+type GlobalState = {
+  sessionStates: Map<string, SessionState>;
+  sessionKeyIndex: Map<string, string>;
+  lastSessionByChannel: Map<string, string>;
+  eventsRegistered: boolean;
+  // Mutable refs updated on each re-init so event handlers use latest instances
+  engine: ReturnType<typeof createMemoryBrainContextEngine> | null;
+  storage: MemoryStorage | null;
+};
+function getGlobalState(): GlobalState {
+  const g = globalThis as typeof globalThis & { [GLOBAL_STATE_KEY]?: GlobalState };
+  if (!g[GLOBAL_STATE_KEY]) {
+    g[GLOBAL_STATE_KEY] = {
+      sessionStates: new Map(),
+      sessionKeyIndex: new Map(),
+      lastSessionByChannel: new Map(),
+      eventsRegistered: false,
+      engine: null,
+      storage: null,
+    };
+  }
+  return g[GLOBAL_STATE_KEY];
+}
 
 interface PluginConfig {
   embedding?: {
@@ -59,27 +87,22 @@ interface PluginConfig {
 }
 
 const DEFAULT_EMBEDDING: Required<EmbeddingConfig> = {
-  apiKey: "local",
-  model: "vllm/Forturne/Qwen3-Embedding-4B-NVFP4",
-  baseURL: "http://127.0.0.1:32080/v1",
-  dimensions: 2560,
+  apiKey: process.env.OPENCLAW_EMBEDDING_API_KEY ?? "local",
+  model: process.env.OPENCLAW_EMBEDDING_MODEL ?? "text-embedding-3-small",
+  baseURL: process.env.OPENCLAW_EMBEDDING_BASE_URL ?? "https://api.openai.com/v1",
+  dimensions: Number(process.env.OPENCLAW_EMBEDDING_DIMENSIONS) || 1536,
 };
 
 const DEFAULT_RETRIEVAL = {
   mode: "hybrid" as const,
-  rerank: true,
-  rerankEndpoint: "http://127.0.0.1:32080/v1/rerank",
-  rerankApiKey: "sk-gb10-vllm-qwen3-rotated-v2",
-  rerankModel: "vllm/Forturne/Qwen3-Reranker-4B-NVFP4",
+  rerank: false,  // off by default — user enables via config with their own endpoint
+  rerankEndpoint: "",
+  rerankApiKey: "",
+  rerankModel: "",
 };
 
 const DEFAULT_WHITELIST = [
   "main",
-  "gb10-deploy",
-  "peter-365",
-  "plaw-coding-team",
-  "tiffany-ops",
-  "gb10-openclaw-pr-reviewer",
 ];
 
 function upsertSessionState(
@@ -118,20 +141,22 @@ export default function register(api: OpenClawPluginApi & { logger?: any; plugin
         ...(config.embedding ?? {}),
       };
       const distillationConfig: DistillerConfig = {
-        model: config.distillation?.model ?? "vllm/Kbenkhaled/Qwen3.5-35B-A3B-NVFP4",
-        baseURL: config.distillation?.baseURL ?? "http://127.0.0.1:32080/v1",
-        apiKey: config.distillation?.apiKey ?? "local",
+        model: config.distillation?.model,   // falls through to createDistiller() defaults + env vars
+        baseURL: config.distillation?.baseURL,
+        apiKey: config.distillation?.apiKey,
       };
 
       const mergedRetrieval = { ...DEFAULT_RETRIEVAL, ...(config.retrieval ?? {}) };
-      const storage = await MemoryStorage.connect(dbPath);
+      const gs = getGlobalState();
+      // Reuse storage across plugin re-inits to avoid stale LanceDB table handles
+      const storage = gs.storage ?? await MemoryStorage.connect(dbPath);
       const embedder = createEmbedder(embeddingConfig);
       const distiller = createDistiller(distillationConfig);
       const owners = normalizeOwners(config.owners);
       const agentWhitelist = config.agentWhitelist ?? DEFAULT_WHITELIST;
-      const sessionStates = new Map<string, SessionState>();
-      const sessionKeyIndex = new Map<string, string>();
-      const lastSessionByChannel = new Map<string, string>();
+      const sessionStates = gs.sessionStates;
+      const sessionKeyIndex = gs.sessionKeyIndex;
+      const lastSessionByChannel = gs.lastSessionByChannel;
 
       registerAllMemoryTools(api, {
         storage,
@@ -154,6 +179,10 @@ export default function register(api: OpenClawPluginApi & { logger?: any; plugin
         lastSessionByChannel,
       });
 
+      // Update global refs so event handlers always use the latest instances
+      gs.engine = engine;
+      gs.storage = storage;
+
       api.registerContextEngine?.("memory-lancedb-brain", () => engine);
       api.registerCommand?.(createMemoryDistillCommand({
         storage,
@@ -167,48 +196,105 @@ export default function register(api: OpenClawPluginApi & { logger?: any; plugin
         lastSessionByChannel,
       }, engine));
 
-      api.on?.("before_prompt_build", (_event: unknown, ctx: any) => {
-        if (!ctx?.sessionId) return;
-        const owner = resolveOwnerFromContext(
-          {
-            senderId: undefined,
-            messageChannel: ctx.channelId,
+      // Only register event handlers once (plugin may re-initialize but api.on accumulates)
+      if (!gs.eventsRegistered) {
+        gs.eventsRegistered = true;
+
+        api.on?.("before_prompt_build", (_event: unknown, ctx: any) => {
+          if (!ctx?.sessionId) return;
+          const owner = resolveOwnerFromContext(
+            {
+              senderId: undefined,
+              messageChannel: ctx.channelId,
+              agentId: ctx.agentId,
+              senderIsOwner: true,
+            },
+            owners,
+          ) ?? (owners[0] ? { ownerId: owners[0].owner_id, ownerNamespace: owners[0].owner_namespace } : undefined);
+
+          upsertSessionState(sessionStates, sessionKeyIndex, lastSessionByChannel, {
+            sessionId: ctx.sessionId,
+            sessionKey: ctx.sessionKey,
             agentId: ctx.agentId,
-            senderIsOwner: true,
-          },
-          owners,
-        ) ?? (owners[0] ? { ownerId: owners[0].owner_id, ownerNamespace: owners[0].owner_namespace } : undefined);
-
-        upsertSessionState(sessionStates, sessionKeyIndex, lastSessionByChannel, {
-          sessionId: ctx.sessionId,
-          sessionKey: ctx.sessionKey,
-          agentId: ctx.agentId,
-          owner,
-          channelId: ctx.channelId,
+            owner,
+            channelId: ctx.channelId,
+          });
         });
-      });
 
-      api.on?.("session_start", (event: any, ctx: any) => {
-        if (!event?.sessionId) return;
-        upsertSessionState(sessionStates, sessionKeyIndex, lastSessionByChannel, {
-          sessionId: event.sessionId,
-          sessionKey: event.sessionKey ?? ctx?.sessionKey,
-          agentId: ctx?.agentId,
-          channelId: ctx?.channelId,
-          owner: owners[0] ? { ownerId: owners[0].owner_id, ownerNamespace: owners[0].owner_namespace } : undefined,
+        api.on?.("session_start", (event: any, ctx: any) => {
+          if (!event?.sessionId) return;
+          upsertSessionState(sessionStates, sessionKeyIndex, lastSessionByChannel, {
+            sessionId: event.sessionId,
+            sessionKey: event.sessionKey ?? ctx?.sessionKey,
+            agentId: ctx?.agentId,
+            channelId: ctx?.channelId,
+            owner: owners[0] ? { ownerId: owners[0].owner_id, ownerNamespace: owners[0].owner_namespace } : undefined,
+          });
         });
-      });
 
-      api.on?.("subagent_spawned", (event: any) => {
-        if (!event?.childSessionKey || !event?.runId) return;
-        const sessionId = sessionKeyIndex.get(event.childSessionKey) ?? event.childSessionKey;
-        upsertSessionState(sessionStates, sessionKeyIndex, lastSessionByChannel, {
-          sessionId,
-          sessionKey: event.childSessionKey,
-          agentId: event.agentId,
-          owner: owners[0] ? { ownerId: owners[0].owner_id, ownerNamespace: owners[0].owner_namespace } : undefined,
+        api.on?.("subagent_spawned", (event: any) => {
+          if (!event?.childSessionKey || !event?.runId) return;
+          const sessionId = sessionKeyIndex.get(event.childSessionKey) ?? event.childSessionKey;
+          upsertSessionState(sessionStates, sessionKeyIndex, lastSessionByChannel, {
+            sessionId,
+            sessionKey: event.childSessionKey,
+            agentId: event.agentId,
+            owner: owners[0] ? { ownerId: owners[0].owner_id, ownerNamespace: owners[0].owner_namespace } : undefined,
+          });
         });
-      });
+
+        // Auto-distill when session ends (triggered by /new, /reset, idle timeout)
+        api.on?.("session_end", async (event: any, _ctx: any) => {
+          if (!event?.sessionId) return;
+          const session = sessionStates.get(event.sessionId);
+          if (!session) {
+            api.logger?.warn?.(`memory-lancedb-brain: session_end ignored — no session state for ${event.sessionId}`);
+            return;
+          }
+
+          // Resolve sessionFile: prefer state, fallback to filesystem
+          let sessionFile = session.sessionFile;
+          if (!sessionFile) {
+            const agentId = session.agentId ?? "main";
+            const candidate = join(
+              process.env.HOME ?? "/home/peter",
+              ".openclaw/agents",
+              agentId,
+              "sessions",
+              `${event.sessionId}.jsonl`,
+            );
+            if (existsSync(candidate)) {
+              sessionFile = candidate;
+              api.logger?.info?.(`memory-lancedb-brain: session_end resolved sessionFile from filesystem: ${candidate}`);
+            }
+          }
+
+          if (!sessionFile) {
+            api.logger?.warn?.(`memory-lancedb-brain: session_end skipped — no sessionFile for ${event.sessionId} (sessionKey=${session.sessionKey})`);
+            return;
+          }
+
+          try {
+            const currentEngine = gs.engine;
+            if (!currentEngine) {
+              api.logger?.warn?.(`memory-lancedb-brain: session_end skipped — engine not initialized`);
+              return;
+            }
+            const result = await currentEngine.compact({
+              sessionId: session.sessionId,
+              sessionFile,
+              force: true,
+            });
+            if (result.ok && result.compacted) {
+              api.logger?.info?.(`memory-lancedb-brain: auto-distill on session_end OK for ${event.sessionId}: inserted ${result.result?.insertedCount ?? 0} memories`);
+            } else {
+              api.logger?.warn?.(`memory-lancedb-brain: auto-distill on session_end no-op for ${event.sessionId}: ${result.reason ?? "no memories"}`);
+            }
+          } catch (err) {
+            api.logger?.warn?.(`memory-lancedb-brain: auto-distill failed on session_end: ${err}`);
+          }
+        });
+      }
 
       (api as any).__memoryLanceDbBrain = {
         storage,

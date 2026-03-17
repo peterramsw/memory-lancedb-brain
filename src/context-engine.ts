@@ -3,12 +3,11 @@
  * Phase 5: Auto-distill with session lifecycle hooks
  */
 
-import { randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
-import type { MemoryRecord, MemoryScope, MemoryType } from "./schema.js";
+import { readFile, readdir } from "node:fs/promises";
+import { dirname, basename, join } from "node:path";
+import type { MemoryRecord, MemoryEventRecord, MemoryScope, MemoryType } from "./schema.js";
 import type { MemoryStorage } from "./storage.js";
 import type { OwnerConfig, ResolvedOwner } from "./owners.js";
-import { hybridRetrieve, generateSummary, generateTitle } from "./retrieval.js";
 import type { DistillOutput } from "./distill.js";
 import { buildCandidateMemories, processLifecycle } from "./lifecycle.js";
 import type { Embedder } from "./embedding.js";
@@ -25,10 +24,10 @@ export interface AgentMessageLike {
 export interface SessionState {
   sessionId: string;
   sessionKey?: string;
+  sessionFile?: string;
   agentId?: string;
   owner?: ResolvedOwner;
   channelId?: string;
-  sessionFile?: string;
   staging: string[];
   childSessionKeys: string[];
   parentSessionKey?: string;
@@ -80,21 +79,19 @@ export interface AssembleResult {
 export interface CompactResult {
   ok: boolean;
   compacted: boolean;
-  reason?: string;
   result?: {
     summary?: string;
-    firstKeptEntryId?: string;
-    tokensBefore: number;
-    tokensAfter?: number;
-    details?: unknown;
+    insertedCount?: number;
+    details?: Record<string, unknown>;
   };
+  reason?: string;
 }
 
-// Default auto-distill config
+// Default config
 const DEFAULT_AUTO_DISTILL: AutoDistillConfig = {
   enabled: true,
   triggers: ["onSubagentEnded", "onSessionEnd", "onReset", "onNew"],
-  minStagingLength: 100,
+  minStagingLength: 3,
   tokenBudget: 30000,
   onSubagentEnded: true,
   onSessionEnd: true,
@@ -102,328 +99,343 @@ const DEFAULT_AUTO_DISTILL: AutoDistillConfig = {
   onNew: true,
 };
 
-function estimateTokens(text: string): number {
-  return Math.ceil(text.length / 4);
+// Helper functions
+function upsertSessionState(
+  deps: ContextEngineDeps,
+  params: {
+    sessionId: string;
+    sessionKey?: string;
+    sessionFile?: string;
+    agentId?: string;
+    ownerId?: string;
+    ownerNamespace?: string;
+    channelId?: string;
+    parentSessionKey?: string;
+  },
+): SessionState {
+  const existing = deps.sessionStates.get(params.sessionId);
+  if (existing) {
+    // Update mutable fields on existing state
+    if (params.sessionFile) existing.sessionFile = params.sessionFile;
+    if (params.sessionKey) existing.sessionKey = params.sessionKey;
+    if (params.agentId) existing.agentId = params.agentId;
+    if (params.channelId) existing.channelId = params.channelId;
+    if (params.ownerId && params.ownerNamespace) {
+      existing.owner = { ownerId: params.ownerId, ownerNamespace: params.ownerNamespace };
+    }
+    existing.updatedAt = Date.now();
+    return existing;
+  }
+
+  const newState: SessionState = {
+    sessionId: params.sessionId,
+    sessionKey: params.sessionKey,
+    sessionFile: params.sessionFile,
+    agentId: params.agentId,
+    owner: params.ownerId && params.ownerNamespace
+      ? { ownerId: params.ownerId, ownerNamespace: params.ownerNamespace }
+      : undefined,
+    channelId: params.channelId,
+    staging: [],
+    childSessionKeys: [],
+    parentSessionKey: params.parentSessionKey,
+    subagentEnded: false,
+    updatedAt: Date.now(),
+  };
+
+  deps.sessionStates.set(params.sessionId, newState);
+
+  if (params.sessionKey) {
+    deps.sessionKeyIndex.set(params.sessionKey, params.sessionId);
+  }
+
+  return newState;
 }
 
-function normalizeText(value: unknown): string {
-  if (typeof value === "string") return value.trim();
-  if (Array.isArray(value)) {
-    return value
-      .map((item) => {
-        if (typeof item === "string") return item;
-        if (item && typeof item === "object") {
-          const text = (item as Record<string, unknown>).text;
-          return typeof text === "string" ? text : "";
-        }
-        return "";
-      })
-      .filter(Boolean)
-      .join("\n")
-      .trim();
+function extractMessageText(message: AgentMessageLike | any): string {
+  if (!message) return "";
+  if (typeof message === "string") return message;
+  if (message.text) return typeof message.text === "string" ? message.text : String(message.text);
+  if (message.content) {
+    const content = message.content;
+    if (Array.isArray(content)) {
+      const textBlocks = content
+        .filter((c: any) => c?.type === "text" && typeof c?.text === "string")
+        .map((c: any) => c.text);
+      if (textBlocks.length > 0) return textBlocks.join(" ");
+    }
+    if (typeof content === "string") return content;
   }
-  if (value && typeof value === "object") {
-    const text = (value as Record<string, unknown>).text;
-    if (typeof text === "string") return text.trim();
-  }
-  return "";
-}
-
-function extractMessageText(message: AgentMessageLike): string {
-  return normalizeText(message?.content) || normalizeText(message?.text) || "";
+  return JSON.stringify(message);
 }
 
 function shouldStageText(text: string): boolean {
-  const normalized = text.trim();
-  if (!normalized || normalized.length < 40) return false;
-  if (/^(ok|yes|no|收到 | 好|thanks|謝謝)$/i.test(normalized)) return false;
+  const trimmed = text.trim();
+  if (!trimmed || trimmed.length < 10) return false;
+  if (trimmed.startsWith("/") && !trimmed.includes(":")) return false;
+  if (trimmed.includes("<relevant-memories>") || trimmed.includes("[MEMORY_RECALL]")) return false;
   return true;
 }
 
-function upsertSessionState(deps: ContextEngineDeps, partial: Partial<SessionState> & { sessionId: string }): SessionState {
-  const existing = deps.sessionStates.get(partial.sessionId);
-  const next: SessionState = {
-    sessionId: partial.sessionId,
-    sessionKey: partial.sessionKey ?? existing?.sessionKey,
-    agentId: partial.agentId ?? existing?.agentId,
-    owner: partial.owner ?? existing?.owner,
-    channelId: partial.channelId ?? existing?.channelId,
-    sessionFile: partial.sessionFile ?? existing?.sessionFile,
-    staging: partial.staging ?? existing?.staging ?? [],
-    childSessionKeys: partial.childSessionKeys ?? existing?.childSessionKeys ?? [],
-    parentSessionKey: partial.parentSessionKey ?? existing?.parentSessionKey,
-    subagentEnded: partial.subagentEnded ?? existing?.subagentEnded ?? false,
-    updatedAt: Date.now(),
-  };
-  deps.sessionStates.set(partial.sessionId, next);
-  if (next.sessionKey) deps.sessionKeyIndex.set(next.sessionKey, next.sessionId);
-  if (next.channelId) deps.lastSessionByChannel.set(next.channelId, next.sessionId);
-  return next;
+// Adaptive retrieval: skip embedding calls for greetings, commands, affirmations
+const SKIP_RETRIEVAL_PATTERNS = [
+  /^(hi|hello|hey|good\s*(morning|afternoon|evening)|你好|嗨|早安|晚安)\b/i,
+  /^\//,
+  /^(yes|no|ok|okay|sure|好|是|對|不|可以|了解|收到|👍|👎|✅|❌)\s*[.!]?$/i,
+  /^(go ahead|continue|proceed|do it|繼續|開始|好的)\s*[.!]?$/i,
+  /^[\p{Emoji}\s]+$/u,
+  /^HEARTBEAT/i,
+];
+
+function shouldSkipRetrieval(query: string): boolean {
+  const trimmed = query.trim();
+  if (trimmed.length < 4) return true;
+  // Force retrieve for memory-intent queries
+  if (/(remember|recall|之前|上次|以前|還記得|記得|提到過|說過|last time|previously)/i.test(trimmed)) return false;
+  if (SKIP_RETRIEVAL_PATTERNS.some(p => p.test(trimmed))) return true;
+  // Skip very short non-question messages
+  const hasCJK = /[\u4e00-\u9fff]/.test(trimmed);
+  if (trimmed.length < (hasCJK ? 6 : 15) && !trimmed.includes('?') && !trimmed.includes('？')) return true;
+  return false;
 }
 
-function resolveOwnerForSession(deps: ContextEngineDeps, session: SessionState): ResolvedOwner | undefined {
-  if (session.owner) return session.owner;
-  const owner = deps.owners[0];
-  return owner
-    ? {
-        ownerId: owner.owner_id,
-        ownerNamespace: owner.owner_namespace,
-      }
-    : undefined;
+// Post-retrieval scoring: recency boost + importance weighting
+function applyPostScoring(memories: MemoryRecord[]): MemoryRecord[] {
+  if (memories.length <= 1) return memories;
+  const now = Date.now();
+  const scored = memories.map(m => {
+    // Recency boost: half-life 14 days, max +0.15 bonus
+    const ageDays = (now - (m.updated_at || m.created_at)) / 86_400_000;
+    const recencyBoost = Math.exp(-ageDays / 14) * 0.15;
+    // Importance weight: brain uses 1-5 scale, normalize to 0-1
+    const importanceWeight = 0.7 + 0.3 * ((m.importance - 1) / 4);
+    const score = (1 + recencyBoost) * importanceWeight;
+    return { memory: m, score };
+  });
+  scored.sort((a, b) => b.score - a.score);
+  return scored.map(s => s.memory);
 }
 
 async function selectRelevantMemories(
   deps: ContextEngineDeps,
   session: SessionState,
-  scope: MemoryScope,
+  scope: "owner_shared" | "agent_local",
   limit: number,
+  query?: string,
 ): Promise<MemoryRecord[]> {
-  const owner = resolveOwnerForSession(deps, session);
-  if (!owner) return [];
+  try {
+    const filters: Record<string, unknown> = { memory_scope: scope as MemoryScope, status: "active" as const };
+    // agent_local memories should only be visible to the agent that created them
+    if (scope === "agent_local" && session.agentId) {
+      filters.agent_id = session.agentId;
+    }
+    let results: MemoryRecord[];
 
-  const querySeed = session.staging.slice(-4).join("\n").trim() || `${session.agentId ?? "agent"} memory context`;
-  const results = await hybridRetrieve(deps.storage, deps.embedder, {
-    query: querySeed,
-    ownerId: owner.ownerId,
-    ownerNamespace: owner.ownerNamespace,
-    agentId: session.agentId,
-    scope,
-    limit,
-    mode: deps.retrieval?.mode,
-    vectorWeight: deps.retrieval?.vectorWeight,
-    bm25Weight: deps.retrieval?.bm25Weight,
-    minScore: deps.retrieval?.minScore ?? 0.15,
-    hardMinScore: deps.retrieval?.hardMinScore ?? 0.05,
-    rerank: deps.retrieval?.rerank,
-    rerankApiKey: deps.retrieval?.rerankApiKey,
-    rerankEndpoint: deps.retrieval?.rerankEndpoint,
-    rerankModel: deps.retrieval?.rerankModel,
-    candidatePoolSize: deps.retrieval?.candidatePoolSize,
-  });
+    if (query && deps.embedder) {
+      // Vector search — fetch 3x candidates then re-rank
+      const embedding = await deps.embedder.embed(query);
+      results = await deps.storage.vectorSearch(embedding, limit * 3, filters);
+    } else {
+      results = await deps.storage.queryMemoriesByFilter(filters);
+    }
 
-  for (const result of results) {
-    await deps.storage.updateMemory(result.memory.memory_id, { last_used_at: Date.now() });
+    // Apply recency + importance scoring, then trim
+    return applyPostScoring(results).slice(0, limit);
+  } catch (error) {
+    console.error(`[memory-lancedb-brain] selectRelevantMemories error (scope=${scope}): ${error instanceof Error ? error.stack : String(error)}`);
+    return [];
   }
-
-  return results.map((result) => result.memory).slice(0, limit);
 }
 
-function trimMemoriesByTokenBudget(memories: MemoryRecord[], tokenBudget: number): MemoryRecord[] {
-  const selected: MemoryRecord[] = [];
-  let used = 0;
-  for (const memory of memories) {
-    const text = `[${memory.memory_type}] ${memory.title}\n${memory.summary || memory.content}`;
-    const tokens = estimateTokens(text);
-    if (used + tokens > tokenBudget) break;
-    selected.push(memory);
-    used += tokens;
+function trimMemoriesByTokenBudget(memories: MemoryRecord[], budget: number): MemoryRecord[] {
+  let totalTokens = 0;
+  const result: MemoryRecord[] = [];
+
+  for (const mem of memories) {
+    const tokens = Math.ceil(mem.content.length / 4);
+    if (totalTokens + tokens > budget) break;
+    totalTokens += tokens;
+    result.push(mem);
   }
-  return selected;
+
+  return result;
+}
+
+function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 4);
 }
 
 function renderMemorySection(title: string, memories: MemoryRecord[]): string {
   if (memories.length === 0) return "";
-  return [
-    `## ${title}`,
-    ...memories.map((memory, index) => `${index + 1}. [${memory.memory_type}] ${memory.title}\n${memory.summary || memory.content}`),
-  ].join("\n");
+  const items = memories.map(m => `- ${m.content}`).join("\n");
+  return `### ${title}\n\n${items}`;
 }
 
-async function readTranscriptText(sessionFile: string, fallbackMessages: AgentMessageLike[], staging: string[]): Promise<string> {
-  try {
-    const raw = await readFile(sessionFile, "utf8");
-    const lines = raw
-      .split(/\n+/)
-      .map((line) => line.trim())
-      .filter(Boolean);
-
-    const transcriptLines: string[] = [];
-    for (const line of lines) {
-      try {
-        const parsed = JSON.parse(line);
-        const role = String(parsed.role ?? parsed.type ?? parsed.source ?? "message");
-        const text = normalizeText(parsed.content) || normalizeText(parsed.text) || normalizeText(parsed.message);
-        if (text) transcriptLines.push(`${role}: ${text}`);
-      } catch {
-        transcriptLines.push(line);
-      }
-    }
-
-    if (staging.length > 0) {
-      transcriptLines.push("[staging]");
-      transcriptLines.push(...staging);
-    }
-
-    return transcriptLines.join("\n");
-  } catch {
-    const fallback = fallbackMessages
-      .map((message) => `${message.role ?? message.type ?? "message"}: ${extractMessageText(message)}`)
-      .filter((line) => !line.endsWith(": "))
-      .concat(staging)
-      .join("\n");
-    return fallback;
-  }
-}
-
-function normalizeScopeRecommendation(scope: DistillOutput["scope_recommendation"], memoryType: MemoryType): MemoryScope {
-  if (scope === "owner_shared") return "owner_shared";
-  if (scope === "agent_local") return "agent_local";
-  if (memoryType === "summary" || memoryType === "fact" || memoryType === "preference" || memoryType === "decision") {
-    return "owner_shared";
-  }
-  return "agent_local";
-}
-
-async function persistDistilledMemories(
-  deps: ContextEngineDeps,
-  session: SessionState,
-  distilled: DistillOutput,
-): Promise<{
-  insertedCount: number;
-  mergedCount: number;
-  supersedeCandidates: number;
-  archivedCount: number;
-  firstMemoryId?: string;
-  insertedTypes: string[];
-}> {
-  const owner = resolveOwnerForSession(deps, session);
-  if (!owner) return { insertedCount: 0, mergedCount: 0, supersedeCandidates: 0, archivedCount: 0, insertedTypes: [] };
-
-  // Build candidate memories from distill output using lifecycle
-  const candidates = await buildCandidateMemories(
-    { storage: deps.storage, embedder: deps.embedder },
-    {
-      sessionId: session.sessionId,
-      ownerId: owner.ownerId,
-      ownerNamespace: owner.ownerNamespace,
-      agentId: session.agentId,
-    },
-    distilled,
-    Date.now(),
-  );
-
-  if (candidates.length === 0) {
-    return { insertedCount: 0, mergedCount: 0, supersedeCandidates: 0, archivedCount: 0, insertedTypes: [] };
-  }
-
-  // Process through lifecycle (merge / supersede detection / insert)
-  const lifecycleResult = await processLifecycle(
-    { storage: deps.storage, embedder: deps.embedder },
-    candidates,
-    { threshold: 0.92 },       // merge threshold
-    { similarityThreshold: 0.80 }, // supersede candidate threshold
-    { maxImportance: 1, daysInactive: 90 }, // archive config
-  );
-
-  const insertedTypes = candidates.map((c) => c.memory_type);
-
-  return {
-    insertedCount: lifecycleResult.inserted,
-    mergedCount: lifecycleResult.merged,
-    supersedeCandidates: lifecycleResult.supersedeCandidates,
-    archivedCount: lifecycleResult.archived,
-    firstMemoryId: lifecycleResult.firstMemoryId,
-    insertedTypes,
-  };
-}
-
-export async function compactSession(
+async function compactSession(
   deps: ContextEngineDeps,
   params: {
     sessionId: string;
     sessionFile: string;
-    messages?: AgentMessageLike[];
     currentTokenCount?: number;
+    force?: boolean;
     customInstructions?: string;
   },
 ): Promise<CompactResult> {
-  const session = upsertSessionState(deps, {
-    sessionId: params.sessionId,
-    sessionFile: params.sessionFile,
-  });
+  try {
+    const session = deps.sessionStates.get(params.sessionId);
 
-  const transcript = await readTranscriptText(params.sessionFile, params.messages ?? [], session.staging);
-  if (!transcript.trim()) {
-    return { ok: true, compacted: false, reason: "empty_transcript" };
-  }
+    // Resolve session file: try original path first, then .reset.* rename
+    let resolvedFile = params.sessionFile;
+    let sessionContent: string;
+    try {
+      sessionContent = await readFile(resolvedFile, "utf-8");
+    } catch {
+      // openclaw renames session files to .jsonl.reset.<timestamp> on /new
+      const dir = dirname(params.sessionFile);
+      const base = basename(params.sessionFile);
+      const files = await readdir(dir);
+      const resetFile = files
+        .filter(f => f.startsWith(base + ".reset."))
+        .sort()
+        .at(-1); // most recent
+      if (resetFile) {
+        resolvedFile = join(dir, resetFile);
+        console.log(`[memory-lancedb-brain] compactSession: resolved renamed file ${resolvedFile}`);
+        sessionContent = await readFile(resolvedFile, "utf-8");
+      } else {
+        throw new Error(`Session file not found: ${params.sessionFile} (no .reset.* variant either)`);
+      }
+    }
+    const lines = sessionContent.split("\n").filter(l => l.trim());
 
-  const distilled = await deps.distiller.distillTranscript(transcript, {
-    customInstructions: params.customInstructions,
-  });
-  const persisted = await persistDistilledMemories(deps, session, distilled);
+    if (lines.length === 0) {
+      return { ok: true, compacted: false, reason: "No session transcript to distill" };
+    }
 
-  if (persisted.firstMemoryId) {
-    await deps.storage.insertEvent({
-      event_id: randomUUID(),
-      memory_id: persisted.firstMemoryId,
-      event_type: "distill",
-      event_time: Date.now(),
-      details_json: JSON.stringify({
-        sessionId: session.sessionId,
-        summary: distilled.session_summary,
-        scope_recommendation: distilled.scope_recommendation,
-        insertedCount: persisted.insertedCount,
-        mergedCount: persisted.mergedCount,
-        supersedeCandidates: persisted.supersedeCandidates,
-        archivedCount: persisted.archivedCount,
-      }),
+    // Build conversation transcript from last 100 messages
+    const transcriptParts: string[] = [];
+    for (const line of lines.slice(-100)) {
+      try {
+        const entry = JSON.parse(line);
+        if (entry?.type !== "message") continue;
+
+        const role = entry.message?.role;
+        const content = entry.message?.content;
+
+        if (role !== "user" && role !== "assistant") continue;
+
+        const text = typeof content === "string"
+          ? content
+          : Array.isArray(content)
+            ? content.filter((c: any) => c?.type === "text").map((c: any) => c.text).join(" ")
+            : JSON.stringify(content);
+
+        if (text && text.trim().length > 10) {
+          transcriptParts.push(`${role}: ${text}`);
+        }
+      } catch {
+        // Ignore parse errors
+      }
+    }
+
+    if (transcriptParts.length < 2) {
+      return { ok: true, compacted: false, reason: "Insufficient conversation content" };
+    }
+
+    const fullTranscript = transcriptParts.join("\n");
+
+    // Distill using LLM
+    const distillResult = await deps.distiller.distillTranscript(fullTranscript, {
+      customInstructions: params.customInstructions,
     });
-  }
 
-  session.staging = [];
-  session.updatedAt = Date.now();
-  deps.sessionStates.set(session.sessionId, session);
+    // Build candidate memories with proper embeddings via lifecycle.ts
+    const ownerId = session?.owner?.ownerId ?? "peter";
+    const ownerNamespace = session?.owner?.ownerNamespace ?? "peter";
+    const agentId = session?.agentId ?? "unknown";
 
-  return {
-    ok: true,
-    compacted: persisted.insertedCount + persisted.mergedCount > 0,
-    result: {
-      summary: distilled.session_summary,
-      firstKeptEntryId: persisted.firstMemoryId,
-      tokensBefore: params.currentTokenCount ?? estimateTokens(transcript),
-      tokensAfter: Math.max(estimateTokens(distilled.session_summary), 1),
-      details: {
-        insertedCount: persisted.insertedCount,
-        mergedCount: persisted.mergedCount,
-        supersedeCandidates: persisted.supersedeCandidates,
-        archivedCount: persisted.archivedCount,
-        insertedTypes: persisted.insertedTypes,
-        scopeRecommendation: distilled.scope_recommendation,
+    const candidates = await buildCandidateMemories(
+      { storage: deps.storage, embedder: deps.embedder },
+      { sessionId: params.sessionId, ownerId, ownerNamespace, agentId },
+      distillResult,
+    );
+
+    if (candidates.length === 0) {
+      return { ok: true, compacted: false, reason: "Distillation produced no memories" };
+    }
+
+    // Process through lifecycle pipeline (merge dedup + supersede detection + insert)
+    const lifecycleResult = await processLifecycle(
+      { storage: deps.storage, embedder: deps.embedder },
+      candidates,
+    );
+
+    return {
+      ok: true,
+      compacted: true,
+      result: {
+        summary: distillResult.session_summary || "Session distilled",
+        insertedCount: lifecycleResult.inserted,
+        details: {
+          insertedCount: lifecycleResult.inserted,
+          merged: lifecycleResult.merged,
+          supersedeCandidates: lifecycleResult.supersedeCandidates,
+          insertedTypes: lifecycleResult.insertedTypes,
+        },
       },
-    },
-  };
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      compacted: false,
+      reason: error instanceof Error ? error.message : "Unknown error",
+    };
+  }
 }
 
-// Auto-distill check function
 async function checkAndAutoDistill(
   deps: ContextEngineDeps,
   session: SessionState,
   trigger: string,
 ): Promise<boolean> {
   const config = deps.autoDistill ?? DEFAULT_AUTO_DISTILL;
-  
+
   if (!config.enabled) {
     return false;
   }
 
-  if (!session.sessionFile || session.staging.length < config.minStagingLength) {
+  if (!session.sessionFile) {
+    console.log(`[memory-lancedb-brain] Auto-distill skipped (${trigger}): no sessionFile for session ${session.sessionId}`);
+    return false;
+  }
+
+  if (session.staging.length < config.minStagingLength) {
+    console.log(`[memory-lancedb-brain] Auto-distill skipped (${trigger}): staging ${session.staging.length} < min ${config.minStagingLength}`);
     return false;
   }
 
   console.log(`[memory-lancedb-brain] Auto-distill triggered by: ${trigger}, staging length: ${session.staging.length}`);
-  
-  const result = await compactSession(deps, {
-    sessionId: session.sessionId,
-    sessionFile: session.sessionFile,
-    currentTokenCount: 0,
-  });
 
-  if (result.ok && result.compacted) {
-    console.log(`[memory-lancedb-brain] Auto-distill successful: inserted ${(result.result?.details as any)?.insertedCount ?? 0} memories`);
-    return true;
+  try {
+    const result = await compactSession(deps, {
+      sessionId: session.sessionId,
+      sessionFile: session.sessionFile,
+      force: true,
+    });
+
+    if (result.ok && result.compacted) {
+      console.log(`[memory-lancedb-brain] Auto-distill success (${trigger}): inserted ${result.result?.insertedCount ?? 0} memories`);
+      session.staging = [];
+      deps.sessionStates.set(session.sessionId, session);
+      return true;
+    }
+
+    console.log(`[memory-lancedb-brain] Auto-distill no-op (${trigger}): ${result.reason ?? "no memories produced"}`);
+    return false;
+  } catch (error) {
+    console.error(`[memory-lancedb-brain] Auto-distill failed (${trigger}): ${error instanceof Error ? error.message : String(error)}`);
+    return false;
   }
-
-  return false;
 }
 
 export function createMemoryBrainContextEngine(deps: ContextEngineDeps) {
@@ -431,11 +443,16 @@ export function createMemoryBrainContextEngine(deps: ContextEngineDeps) {
     info: {
       id: "memory-lancedb-brain",
       name: "Memory LanceDB Brain",
-      ownsCompaction: true,
+      ownsCompaction: false,
     },
 
     async bootstrap(params: { sessionId: string; sessionFile: string }) {
-      upsertSessionState(deps, { sessionId: params.sessionId, sessionFile: params.sessionFile });
+      console.log(`[memory-lancedb-brain] bootstrap: sessionId=${params.sessionId} sessionFile=${params.sessionFile}`);
+      upsertSessionState(deps, {
+        sessionId: params.sessionId,
+        sessionKey: params.sessionFile.replace(/\.jsonl$/, ""),
+        sessionFile: params.sessionFile,
+      });
       return { bootstrapped: true, importedMessages: 0 };
     },
 
@@ -458,8 +475,10 @@ export function createMemoryBrainContextEngine(deps: ContextEngineDeps) {
       prePromptMessageCount: number;
       autoCompactionSummary?: string;
     }) {
+      console.log(`[memory-lancedb-brain] afterTurn: sessionId=${params.sessionId} sessionFile=${params.sessionFile} messages=${params.messages.length}`);
       const session = upsertSessionState(deps, {
         sessionId: params.sessionId,
+        sessionKey: params.sessionFile.replace(/\.jsonl$/, ""),
         sessionFile: params.sessionFile,
       });
       for (const message of params.messages.slice(params.prePromptMessageCount)) {
@@ -475,17 +494,39 @@ export function createMemoryBrainContextEngine(deps: ContextEngineDeps) {
 
     async assemble(params: { sessionId: string; messages: AgentMessageLike[]; tokenBudget?: number }): Promise<AssembleResult> {
       const session = upsertSessionState(deps, { sessionId: params.sessionId });
-      const ownerShared = trimMemoriesByTokenBudget(await selectRelevantMemories(deps, session, "owner_shared", 5), 800);
-      const agentLocal = trimMemoriesByTokenBudget(await selectRelevantMemories(deps, session, "agent_local", 3), 400);
+      const recentStaging = session.staging.slice(-5).join(" ").slice(0, 300);
+
+      // Adaptive: skip retrieval for greetings, commands, short affirmations
+      if (!recentStaging || shouldSkipRetrieval(recentStaging)) {
+        return { messages: params.messages, estimatedTokens: 0 };
+      }
+
+      const ownerShared = trimMemoriesByTokenBudget(await selectRelevantMemories(deps, session, "owner_shared", 15, recentStaging), 2000);
+      const agentLocal = trimMemoriesByTokenBudget(await selectRelevantMemories(deps, session, "agent_local", 5, recentStaging), 800);
+      console.log(`[memory-lancedb-brain] assemble: sessionId=${params.sessionId} query=${recentStaging.slice(0, 60)}... ownerShared=${ownerShared.length} agentLocal=${agentLocal.length}`);
+
+      if (ownerShared.length === 0 && agentLocal.length === 0) {
+        return { messages: params.messages, estimatedTokens: 0 };
+      }
+
       const sections = [
         renderMemorySection("OWNER SHARED MEMORY", ownerShared),
         renderMemorySection("AGENT LOCAL MEMORY", agentLocal),
       ].filter(Boolean);
-      const addition = sections.join("\n\n");
+
+      const memoryBlock = [
+        "<long-term-memory>",
+        "Facts about this user from previous conversations. Use them proactively to provide personalized context.",
+        "Do NOT announce that you remember things or say \"I've noted that\". Just use the knowledge naturally.",
+        "",
+        sections.join("\n\n"),
+        "</long-term-memory>",
+      ].join("\n");
+
       return {
         messages: params.messages,
-        estimatedTokens: addition ? estimateTokens(addition) : 0,
-        systemPromptAddition: addition || undefined,
+        estimatedTokens: estimateTokens(memoryBlock),
+        systemPromptAddition: memoryBlock,
       };
     },
 
@@ -501,6 +542,7 @@ export function createMemoryBrainContextEngine(deps: ContextEngineDeps) {
         sessionId: params.sessionId,
         sessionFile: params.sessionFile,
         currentTokenCount: params.currentTokenCount,
+        force: params.force,
         customInstructions: params.customInstructions,
       });
     },
@@ -519,7 +561,8 @@ export function createMemoryBrainContextEngine(deps: ContextEngineDeps) {
         sessionId: childSessionId,
         sessionKey: params.childSessionKey,
         agentId: parent.agentId,
-        owner: parent.owner,
+        ownerId: parent.owner?.ownerId,
+        ownerNamespace: parent.owner?.ownerNamespace,
         channelId: parent.channelId,
         parentSessionKey: params.parentSessionKey,
       });
@@ -567,39 +610,219 @@ export function createMemoryDistillCommand(
 ) {
   return {
     name: "memory",
-    description: "Manual memory operations for memory-lancedb-brain.",
+    description: "Manual memory operations for memory-lancedb-brain: distill, recall, list, store.",
     acceptsArgs: true,
     handler: async (ctx: { args?: string; channel: string }) => {
       const args = (ctx.args ?? "").trim();
-      if (!args.toLowerCase().startsWith("distill")) {
-        return { text: "Usage: /memory distill" };
+      if (!args) {
+        return { 
+          text: `Usage:\n  /memory distill — Force distill current session to LanceDB\n  /memory recall [query] — Search memories by query\n  /memory list [scope] — List memories by scope (owner_shared/agent_local/all)\n  /memory store [text] — Store a single memory immediately`,
+        };
       }
 
-      const sessionId = deps.lastSessionByChannel.get(ctx.channel) ?? [...deps.sessionStates.keys()].at(-1);
-      if (!sessionId) {
-        return { text: "No active session available for distillation yet." };
+      // Parse command and arguments
+      const parts = args.split(/\s+/);
+      const command = parts[0]?.toLowerCase();
+      const subArgs = parts.slice(1).join(" ");
+
+      switch (command) {
+        case "distill": {
+          const sessionId = deps.lastSessionByChannel.get(ctx.channel) ?? [...deps.sessionStates.keys()].at(-1);
+          if (!sessionId) {
+            return { text: "No active session available for distillation yet." };
+          }
+
+          const session = deps.sessionStates.get(sessionId);
+          if (!session) {
+            return { text: "Session not found in memory states." };
+          }
+
+          // We can't distill without sessionFile, so return appropriate message
+          if (!session.sessionFile) {
+            return { text: "Cannot distill: no session transcript file available. Please complete some conversation first." };
+          }
+
+          const result = await engine.compact({
+            sessionId,
+            sessionFile: session.sessionFile,
+            force: true,
+            currentTokenCount: 0,
+          });
+
+          if (!result.ok) {
+            return { text: `Distillation failed: ${result.reason ?? "unknown error"}`, isError: true };
+          }
+
+          const details = (result.result?.details ?? {}) as Record<string, unknown>;
+          return {
+            text: `Distilled session ${sessionId}: inserted ${details.insertedCount ?? 0} memories.`,
+          };
+        }
+
+        case "recall": {
+          if (!subArgs || subArgs.trim().length < 3) {
+            return { text: "Usage: /memory recall [query]\nEnter a search query to find relevant memories." };
+          }
+
+          const sessionId = deps.lastSessionByChannel.get(ctx.channel) ?? [...deps.sessionStates.keys()].at(-1);
+          if (!sessionId) {
+            return { text: "No active session available for recall." };
+          }
+
+          const session = deps.sessionStates.get(sessionId);
+          if (!session) {
+            return { text: "Session not found in memory states." };
+          }
+
+          try {
+            // Select memories from both scopes
+            const ownerShared = await selectRelevantMemories(deps, session, "owner_shared", 5, subArgs);
+            const agentLocal = await selectRelevantMemories(deps, session, "agent_local", 3, subArgs);
+            
+            let response = "";
+            if (ownerShared.length > 0) {
+              response += "### OWNER SHARED MEMORY\n\n";
+              for (const mem of ownerShared) {
+                response += `- [${mem.memory_scope}] ${mem.content}\n`;
+              }
+            }
+            if (agentLocal.length > 0) {
+              response += "\n### AGENT LOCAL MEMORY\n\n";
+              for (const mem of agentLocal) {
+                response += `- [${mem.memory_scope}] ${mem.content}\n`;
+              }
+            }
+
+            if (!response) {
+              return { text: "No relevant memories found for your query." };
+            }
+
+            return { text: response.trim() };
+          } catch (error) {
+            return { text: `Recall failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
+          }
+        }
+
+        case "list": {
+          const scopeFilter = subArgs?.toLowerCase() || "all";
+          const validScopes = ["owner_shared", "agent_local", "all"];
+          if (!validScopes.includes(scopeFilter)) {
+            return { text: `Invalid scope: ${scopeFilter}. Use: owner_shared, agent_local, or all.` };
+          }
+
+          const sessionId = deps.lastSessionByChannel.get(ctx.channel) ?? [...deps.sessionStates.keys()].at(-1);
+          if (!sessionId) {
+            return { text: "No active session available for listing." };
+          }
+
+          const session = deps.sessionStates.get(sessionId);
+          if (!session) {
+            return { text: "Session not found in memory states." };
+          }
+
+          try {
+            let results: MemoryRecord[] = [];
+            
+            if (scopeFilter === "all" || scopeFilter === "owner_shared") {
+              const shared = await selectRelevantMemories(deps, session, "owner_shared", 20, undefined);
+              results = results.concat(shared);
+            }
+            if (scopeFilter === "all" || scopeFilter === "agent_local") {
+              const local = await selectRelevantMemories(deps, session, "agent_local", 20, undefined);
+              results = results.concat(local);
+            }
+
+            if (results.length === 0) {
+              return { text: `No memories found${scopeFilter !== "all" ? ` in scope: ${scopeFilter}` : ""}. Try /memory distill first to save conversation context.` };
+            }
+
+            let response = `### MEMORIES (${results.length} total)\n\n`;
+            for (const mem of results.slice(0, 20)) {
+              response += `- [${mem.memory_scope}] ${mem.content}\n`;
+            }
+
+            return { text: response.trim() };
+          } catch (error) {
+            return { text: `List failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
+          }
+        }
+
+        case "store": {
+          if (!subArgs || subArgs.trim().length < 3) {
+            return { text: "Usage: /memory store [text]\nEnter a short statement to memorize immediately." };
+          }
+
+          const sessionId = deps.lastSessionByChannel.get(ctx.channel) ?? [...deps.sessionStates.keys()].at(-1);
+          if (!sessionId) {
+            return { text: "No active session available." };
+          }
+
+          const session = deps.sessionStates.get(sessionId);
+          if (!session) {
+            return { text: "Session not found." };
+          }
+
+          try {
+            // Determine appropriate scope based on who is speaking
+            const targetScope: MemoryScope = session.owner?.ownerNamespace === "agent_local" ? "agent_local" : "owner_shared";
+            const now = Date.now();
+
+            // Get agent ID from session or fallback
+            const agentId = session.agentId || "unknown";
+            const ownerId = session.owner?.ownerId || "peter";
+            const ownerNamespace = session.owner?.ownerNamespace || "peter";
+
+            // Generate embedding so vector search can find this memory
+            const embedding = await deps.embedder.embed(subArgs.trim());
+
+            const memory: MemoryRecord = {
+              memory_id: crypto.randomUUID(),
+              owner_namespace: ownerNamespace,
+              owner_id: ownerId,
+              agent_id: agentId,
+              memory_scope: targetScope,
+              memory_type: "preference" as MemoryType,
+              title: subArgs.trim().slice(0, 50),
+              content: subArgs.trim(),
+              summary: subArgs.trim(),
+              tags: JSON.stringify(["manual"]),
+              importance: 4,
+              confidence: 1.0,
+              status: "active",
+              supersedes_id: "",
+              created_at: now,
+              updated_at: now,
+              last_used_at: now,
+              source_session_id: sessionId,
+              embedding,
+            };
+
+            await deps.storage.insertMemory(memory);
+            
+            // Create event
+            const event: MemoryEventRecord = {
+              event_id: crypto.randomUUID(),
+              memory_id: memory.memory_id,
+              event_type: "create",
+              event_time: now,
+              details_json: JSON.stringify({
+                source: "direct_user_input",
+                manual_store: true,
+              }),
+            };
+            await deps.storage.insertEvent(event);
+            
+            return { text: `Stored: "${subArgs.trim()}"\nSaved to: ${targetScope}\nID: ${memory.memory_id.slice(0, 8)}...` };
+          } catch (error) {
+            return { text: `Store failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
+          }
+        }
+
+        default:
+          return { 
+            text: `Unknown command: ${command}.\n\nUsage:\n  /memory distill\n  /memory recall [query]\n  /memory list [scope]\n  /memory store [text]`,
+          };
       }
-
-      const session = deps.sessionStates.get(sessionId);
-      if (!session?.sessionFile) {
-        return { text: "No session transcript available yet for distillation." };
-      }
-
-      const result = await engine.compact({
-        sessionId,
-        sessionFile: session.sessionFile,
-        force: true,
-        currentTokenCount: 0,
-      });
-
-      if (!result.ok) {
-        return { text: `Distillation failed: ${result.reason ?? "unknown error"}`, isError: true };
-      }
-
-      const details = (result.result?.details ?? {}) as Record<string, unknown>;
-      return {
-        text: `Distilled session ${sessionId}: inserted ${details.insertedCount ?? 0} memories (${Array.isArray(details.insertedTypes) ? details.insertedTypes.join(", ") : "n/a"}).`,
-      };
     },
   };
 }

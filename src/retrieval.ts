@@ -125,22 +125,29 @@ async function rerankResults(
     const ranked = payload?.results ?? payload?.data ?? [];
     if (!Array.isArray(ranked) || ranked.length === 0) return results;
 
-    const scoreById = new Map<string, number>();
+    const rerankScoreById = new Map<string, number>();
     for (const item of ranked) {
       const id = item.document?.id ?? item.id;
       const score = Number(item.relevance_score ?? item.score ?? 0);
       if (typeof id === "string") {
-        scoreById.set(id, score);
+        rerankScoreById.set(id, score);
       } else if (typeof item.index === "number" && item.index < results.length) {
-        scoreById.set(results[item.index].memory.memory_id, score);
+        rerankScoreById.set(results[item.index].memory.memory_id, score);
       }
     }
 
-    return [...results].sort((a, b) => {
-      const aScore = scoreById.get(a.memory.memory_id) ?? a.score;
-      const bScore = scoreById.get(b.memory.memory_id) ?? b.score;
-      return bScore - aScore;
-    });
+    // Blend: 60% rerank score + 40% original score (not just re-sort)
+    return [...results]
+      .map(r => {
+        const rerankScore = rerankScoreById.get(r.memory.memory_id);
+        return {
+          ...r,
+          score: rerankScore != null
+            ? rerankScore * 0.6 + r.score * 0.4
+            : r.score * 0.8,  // penalize unreturned candidates slightly
+        };
+      })
+      .sort((a, b) => b.score - a.score);
   } catch {
     return results;
   }
@@ -227,6 +234,8 @@ export function detectCategory(text: string): MemoryRecord["memory_type"] {
   if (/(喜歡|偏好|prefer|preference|love|hate|習慣)/i.test(value)) return "preference";
   if (/(決定|改用|decide|選擇|決策)/i.test(value)) return "decision";
   if (/(避免|不要|坑|pitfall|問題|bug)/i.test(value)) return "pitfall";
+  if (/(不對|不是|wrong|correct|糾正|應該是)/i.test(value)) return "correction";
+  if (/(有效|成功|這樣做|best practice|這招|管用)/i.test(value)) return "best_practice";
   if (/(待辦|todo|要做|需要處理|follow up)/i.test(value)) return "todo";
   if (/(摘要|總結|summary)/i.test(value)) return "summary";
   if (/(狀態|status|進度)/i.test(value)) return "status";
