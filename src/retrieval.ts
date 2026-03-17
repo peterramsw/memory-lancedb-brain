@@ -127,9 +127,13 @@ async function rerankResults(
 
     const scoreById = new Map<string, number>();
     for (const item of ranked) {
-      const id = item.document?.id ?? item.id ?? item.index;
+      const id = item.document?.id ?? item.id;
       const score = Number(item.relevance_score ?? item.score ?? 0);
-      if (typeof id === "string") scoreById.set(id, score);
+      if (typeof id === "string") {
+        scoreById.set(id, score);
+      } else if (typeof item.index === "number" && item.index < results.length) {
+        scoreById.set(results[item.index].memory.memory_id, score);
+      }
     }
 
     return [...results].sort((a, b) => {

@@ -55,6 +55,14 @@ const DEFAULT_EMBEDDING: Required<EmbeddingConfig> = {
   dimensions: 2560,
 };
 
+const DEFAULT_RETRIEVAL = {
+  mode: "hybrid" as const,
+  rerank: true,
+  rerankEndpoint: "http://127.0.0.1:32080/v1/rerank",
+  rerankApiKey: "sk-gb10-vllm-qwen3-rotated-v2",
+  rerankModel: "vllm/Forturne/Qwen3-Reranker-4B-NVFP4",
+};
+
 const DEFAULT_WHITELIST = [
   "main",
   "gb10-deploy",
@@ -105,6 +113,7 @@ export default function register(api: OpenClawPluginApi & { logger?: any; plugin
         apiKey: config.distillation?.apiKey ?? "local",
       };
 
+      const mergedRetrieval = { ...DEFAULT_RETRIEVAL, ...(config.retrieval ?? {}) };
       const storage = await MemoryStorage.connect(dbPath);
       const embedder = createEmbedder(embeddingConfig);
       const distiller = createDistiller(distillationConfig);
@@ -119,7 +128,7 @@ export default function register(api: OpenClawPluginApi & { logger?: any; plugin
         embedder,
         owners,
         agentWhitelist,
-        retrieval: config.retrieval,
+        retrieval: mergedRetrieval,
       });
 
       const engine = createMemoryBrainContextEngine({
@@ -128,7 +137,7 @@ export default function register(api: OpenClawPluginApi & { logger?: any; plugin
         distiller,
         owners,
         agentWhitelist,
-        retrieval: config.retrieval,
+        retrieval: mergedRetrieval,
         sessionStates,
         sessionKeyIndex,
         lastSessionByChannel,
@@ -141,7 +150,7 @@ export default function register(api: OpenClawPluginApi & { logger?: any; plugin
         distiller,
         owners,
         agentWhitelist,
-        retrieval: config.retrieval,
+        retrieval: mergedRetrieval,
         sessionStates,
         sessionKeyIndex,
         lastSessionByChannel,
