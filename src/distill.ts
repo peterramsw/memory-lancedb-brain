@@ -12,6 +12,12 @@ export interface DistillOutput {
   open_loops: string[];
   corrections: string[];
   best_practices: string[];
+  // Tier 2 fields (items 5, 8, 9)
+  style_observations: string[];
+  expertise_signals: string[];
+  active_goals: string[];
+  // Contradiction detection (item 2)
+  contradictions: string[];
   scope_recommendation: "owner_shared" | "agent_local" | "both";
 }
 
@@ -33,6 +39,10 @@ const DEFAULT_OUTPUT: DistillOutput = {
   open_loops: [],
   corrections: [],
   best_practices: [],
+  style_observations: [],
+  expertise_signals: [],
+  active_goals: [],
+  contradictions: [],
   scope_recommendation: "agent_local",
 };
 
@@ -53,6 +63,10 @@ function normalizeOutput(payload: Partial<DistillOutput> | null | undefined): Di
     open_loops: ensureArrayOfStrings(payload?.open_loops),
     corrections: ensureArrayOfStrings(payload?.corrections),
     best_practices: ensureArrayOfStrings(payload?.best_practices),
+    style_observations: ensureArrayOfStrings(payload?.style_observations),
+    expertise_signals: ensureArrayOfStrings(payload?.expertise_signals),
+    active_goals: ensureArrayOfStrings(payload?.active_goals),
+    contradictions: ensureArrayOfStrings(payload?.contradictions),
     scope_recommendation:
       scope === "owner_shared" || scope === "agent_local" || scope === "both"
         ? scope
@@ -143,6 +157,25 @@ export function heuristicDistill(transcript: string): DistillOutput {
     .map((line) => `有效做法: ${line.slice(0, 200)}`)
     .slice(0, 3);
 
+  // Extract style observations (item 5)
+  const styleObs: string[] = [];
+  const hasChinese = userLines.some((l) => /[\u4e00-\u9fff]/.test(l));
+  const hasEnglish = userLines.some((l) => /[a-zA-Z]{3,}/.test(l));
+  if (hasChinese && hasEnglish) styleObs.push("用戶使用中英混合溝通");
+  else if (hasChinese) styleObs.push("用戶主要使用中文溝通");
+
+  // Extract expertise signals (item 8)
+  const expertiseSignals = userLines
+    .filter((line) => /精通|專長|expertise|experienced|years|年|senior|expert|擅長/i.test(line))
+    .map((line) => `用戶專長: ${line.slice(0, 200)}`)
+    .slice(0, 3);
+
+  // Extract active goals (item 9)
+  const activeGoals = userLines
+    .filter((line) => /目標|goal|project|專案|計畫|plan|building|開發中|正在做/i.test(line))
+    .map((line) => `用戶目標: ${line.slice(0, 200)}`)
+    .slice(0, 3);
+
   return normalizeOutput({
     ...DEFAULT_OUTPUT,
     session_summary: summary,
@@ -154,6 +187,10 @@ export function heuristicDistill(transcript: string): DistillOutput {
     open_loops: todos,
     corrections,
     best_practices: bestPractices,
+    style_observations: styleObs,
+    expertise_signals: expertiseSignals,
+    active_goals: activeGoals,
+    contradictions: [],
     scope_recommendation: "owner_shared",
   });
 }
@@ -188,6 +225,10 @@ const DISTILL_SYSTEM_PROMPT = `You are a memory distillation engine that extract
   "open_loops": ["tasks the user mentioned but didn't complete"],
   "corrections": ["things the user corrected about the assistant's response or approach"],
   "best_practices": ["approaches or patterns that worked well and should be reused"],
+  "style_observations": ["user communication style: language, tone, verbosity, formatting preferences"],
+  "expertise_signals": ["domains where user showed expertise or novice level, with evidence"],
+  "active_goals": ["ongoing projects or goals the user is working toward"],
+  "contradictions": ["new facts that CONTRADICT previously known facts — format: 'NEW: X (supersedes OLD: Y)'"],
   "scope_recommendation": "owner_shared"
 }
 
@@ -201,9 +242,17 @@ const DISTILL_SYSTEM_PROMPT = `You are a memory distillation engine that extract
 - pitfalls: Bugs hit, errors encountered, things that didn't work
 - corrections: When the user says "不對/wrong/不是那樣" and provides the right answer. Write as: "正確做法：X（而非 Y）"
 - best_practices: Approaches that solved a problem well. Write as: "做 X 時應該用 Y 方法" — only extract if the user confirmed it works
+- style_observations: How the user communicates — language (中文/English/mixed), preferred response length (concise vs detailed), whether they use emoji, prefer markdown, want conclusions first. Write as: "用戶偏好簡潔回答" or "User prefers concise answers without emoji"
+- expertise_signals: What the user is expert/novice at — "用戶精通 C# 和嵌入式系統" or "用戶剛接觸 React，需要詳細解釋". Only extract if the user explicitly shows or states expertise level
+- active_goals: Ongoing projects — "用戶正在開發 Sherpa-ONNX 會議逐字稿 SaaS" or "User is building a memory plugin for openclaw". Include project name, current status if mentioned
+- contradictions: When the user states something that contradicts a previous statement in THIS conversation. Format: "NEW: 用戶改用 Ubuntu (supersedes OLD: 用戶用 Windows)". Only flag clear contradictions, not updates
 - scope_recommendation: Almost always "owner_shared" — use "agent_local" only for agent-specific config`;
 
-async function callChatCompletions(config: Required<Pick<DistillerConfig, "baseURL" | "model" | "apiKey">> & DistillerConfig, transcript: string, customInstructions?: string): Promise<string> {
+async function callChatCompletionsInternal(
+  config: Required<Pick<DistillerConfig, "baseURL" | "model" | "apiKey">> & DistillerConfig,
+  systemPrompt: string,
+  userPrompt: string,
+): Promise<string> {
   const fetchImpl = config.fetchImpl ?? fetch;
   const response = await fetchImpl(`${config.baseURL}/chat/completions`, {
     method: "POST",
@@ -216,25 +265,35 @@ async function callChatCompletions(config: Required<Pick<DistillerConfig, "baseU
       temperature: 0.1,
       max_tokens: 4096,
       messages: [
-        {
-          role: "system",
-          content: DISTILL_SYSTEM_PROMPT,
-        },
-        {
-          role: "user",
-          content:
-            `${customInstructions ? `${customInstructions}\n\n` : ""}Distill the following conversation into structured memory JSON. Extract ONLY what the USER said or confirmed:\n\n${transcript}`,
-        },
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
       ],
     }),
   });
 
   if (!response.ok) {
-    throw new Error(`Distillation API error: ${response.status} ${response.statusText}`);
+    throw new Error(`LLM API error: ${response.status} ${response.statusText}`);
   }
 
   const payload = await response.json();
   return String(payload?.choices?.[0]?.message?.content ?? "");
+}
+
+/**
+ * Generic LLM caller for use by consolidation, profile synthesis, etc.
+ * Uses the same config as the distiller.
+ */
+export function createLLMCaller(config: DistillerConfig) {
+  const resolved = {
+    model: config.model ?? process.env.OPENCLAW_DISTILL_MODEL ?? "gpt-4o-mini",
+    baseURL: config.baseURL ?? process.env.OPENCLAW_DISTILL_BASE_URL ?? "https://api.openai.com/v1",
+    apiKey: config.apiKey ?? process.env.OPENCLAW_DISTILL_API_KEY ?? "",
+    ...config,
+  };
+
+  return async (systemPrompt: string, userPrompt: string): Promise<string> => {
+    return callChatCompletionsInternal(resolved, systemPrompt, userPrompt);
+  };
 }
 
 export function createDistiller(config: DistillerConfig) {
@@ -252,10 +311,11 @@ export function createDistiller(config: DistillerConfig) {
       }
 
       try {
-        const raw = await callChatCompletions(resolved, transcript, opts?.customInstructions);
+        const userPrompt = `${opts?.customInstructions ? `${opts.customInstructions}\n\n` : ""}Distill the following conversation into structured memory JSON. Extract ONLY what the USER said or confirmed:\n\n${transcript}`;
+        const raw = await callChatCompletionsInternal(resolved, DISTILL_SYSTEM_PROMPT, userPrompt);
         const parsed = parseDistillJson(raw);
         if (parsed) {
-          console.log(`[memory-lancedb-brain] distill: LLM OK — facts=${parsed.confirmed_facts.length} prefs=${parsed.preference_updates.length} env=${parsed.environment_truths.length} decisions=${parsed.decisions.length}`);
+          console.log(`[memory-lancedb-brain] distill: LLM OK — facts=${parsed.confirmed_facts.length} prefs=${parsed.preference_updates.length} env=${parsed.environment_truths.length} decisions=${parsed.decisions.length} goals=${parsed.active_goals.length} contradictions=${parsed.contradictions.length}`);
           return parsed;
         }
         console.warn(`[memory-lancedb-brain] distill: LLM returned unparseable JSON, falling back to heuristic. Raw (first 200): ${raw.slice(0, 200)}`);

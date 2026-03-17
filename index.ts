@@ -6,7 +6,7 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
-import { createDistiller, type DistillerConfig } from "./src/distill.js";
+import { createDistiller, createLLMCaller, type DistillerConfig } from "./src/distill.js";
 import {
   createMemoryBrainContextEngine,
   createMemoryDistillCommand,
@@ -152,6 +152,7 @@ export default function register(api: OpenClawPluginApi & { logger?: any; plugin
       const storage = gs.storage ?? await MemoryStorage.connect(dbPath);
       const embedder = createEmbedder(embeddingConfig);
       const distiller = createDistiller(distillationConfig);
+      const llmCaller = createLLMCaller(distillationConfig);
       const owners = normalizeOwners(config.owners);
       const agentWhitelist = config.agentWhitelist ?? DEFAULT_WHITELIST;
       const sessionStates = gs.sessionStates;
@@ -170,6 +171,7 @@ export default function register(api: OpenClawPluginApi & { logger?: any; plugin
         storage,
         embedder,
         distiller,
+        llmCaller,
         owners,
         agentWhitelist,
         retrieval: mergedRetrieval,
@@ -188,6 +190,7 @@ export default function register(api: OpenClawPluginApi & { logger?: any; plugin
         storage,
         embedder,
         distiller,
+        llmCaller,
         owners,
         agentWhitelist,
         retrieval: mergedRetrieval,

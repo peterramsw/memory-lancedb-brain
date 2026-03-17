@@ -237,6 +237,7 @@ export function detectCategory(text: string): MemoryRecord["memory_type"] {
   if (/(不對|不是|wrong|correct|糾正|應該是)/i.test(value)) return "correction";
   if (/(有效|成功|這樣做|best practice|這招|管用)/i.test(value)) return "best_practice";
   if (/(待辦|todo|要做|需要處理|follow up)/i.test(value)) return "todo";
+  if (/(目標|goal|project|專案|計畫|ongoing)/i.test(value)) return "goal";
   if (/(摘要|總結|summary)/i.test(value)) return "summary";
   if (/(狀態|status|進度)/i.test(value)) return "status";
   return "fact";
@@ -253,6 +254,9 @@ export function mapCategory(input?: string): MemoryRecord["memory_type"] | undef
     "status",
     "todo",
     "summary",
+    "goal",
+    "correction",
+    "best_practice",
   ];
   if ((allowed as string[]).includes(value)) return value as MemoryRecord["memory_type"];
   return detectCategory(value);

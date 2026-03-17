@@ -9,7 +9,8 @@ import type { MemoryRecord, MemoryEventRecord, MemoryScope, MemoryType } from ".
 import type { MemoryStorage } from "./storage.js";
 import type { OwnerConfig, ResolvedOwner } from "./owners.js";
 import type { DistillOutput } from "./distill.js";
-import { buildCandidateMemories, processLifecycle } from "./lifecycle.js";
+import type { LLMCaller } from "./lifecycle.js";
+import { buildCandidateMemories, processLifecycle, resolveContradictions, applyConfidenceDecay, consolidateMemories, synthesizeUserProfile } from "./lifecycle.js";
 import type { Embedder } from "./embedding.js";
 
 export interface AgentMessageLike {
@@ -50,6 +51,7 @@ export interface ContextEngineDeps {
   storage: MemoryStorage;
   embedder: Embedder;
   distiller: { distillTranscript(transcript: string, opts?: { customInstructions?: string }): Promise<DistillOutput> };
+  llmCaller?: LLMCaller;
   owners: OwnerConfig[];
   agentWhitelist: string[];
   retrieval?: {
@@ -199,7 +201,7 @@ function shouldSkipRetrieval(query: string): boolean {
   return false;
 }
 
-// Post-retrieval scoring: recency boost + importance weighting
+// Post-retrieval scoring: recency boost + importance weighting + type boosting (item 6)
 function applyPostScoring(memories: MemoryRecord[]): MemoryRecord[] {
   if (memories.length <= 1) return memories;
   const now = Date.now();
@@ -209,7 +211,13 @@ function applyPostScoring(memories: MemoryRecord[]): MemoryRecord[] {
     const recencyBoost = Math.exp(-ageDays / 14) * 0.15;
     // Importance weight: brain uses 1-5 scale, normalize to 0-1
     const importanceWeight = 0.7 + 0.3 * ((m.importance - 1) / 4);
-    const score = (1 + recencyBoost) * importanceWeight;
+    // Item 3: Confidence factor — decayed memories rank lower
+    const confidenceFactor = 0.5 + 0.5 * m.confidence;
+    // Item 6: Proactive recall — boost corrections, best_practices, goals
+    const typeBoost = (m.memory_type === "correction" || m.memory_type === "best_practice") ? 1.15
+      : m.memory_type === "goal" ? 1.10
+      : 1.0;
+    const score = (1 + recencyBoost) * importanceWeight * confidenceFactor * typeBoost;
     return { memory: m, score };
   });
   scored.sort((a, b) => b.score - a.score);
@@ -348,6 +356,21 @@ async function compactSession(
     const distillResult = await deps.distiller.distillTranscript(fullTranscript, {
       customInstructions: params.customInstructions,
     });
+
+    // Item 2: Resolve contradictions before inserting new memories
+    if (distillResult.contradictions.length > 0) {
+      const ownerId2 = session?.owner?.ownerId ?? "peter";
+      const ownerNamespace2 = session?.owner?.ownerNamespace ?? "peter";
+      const { resolved } = await resolveContradictions(
+        { storage: deps.storage, embedder: deps.embedder },
+        distillResult.contradictions,
+        ownerId2,
+        ownerNamespace2,
+      );
+      if (resolved > 0) {
+        console.log(`[memory-lancedb-brain] compactSession: resolved ${resolved} contradictions`);
+      }
+    }
 
     // Build candidate memories with proper embeddings via lifecycle.ts
     const ownerId = session?.owner?.ownerId ?? "peter";
@@ -509,6 +532,12 @@ export function createMemoryBrainContextEngine(deps: ContextEngineDeps) {
         return { messages: params.messages, estimatedTokens: 0 };
       }
 
+      // Item 3: Track last_used_at for retrieved memories (fire-and-forget)
+      const allRetrieved = [...ownerShared, ...agentLocal];
+      void Promise.all(allRetrieved.map((m) =>
+        deps.storage.updateMemory(m.memory_id, { last_used_at: Date.now() }).catch(() => {}),
+      ));
+
       const sections = [
         renderMemorySection("OWNER SHARED MEMORY", ownerShared),
         renderMemorySection("AGENT LOCAL MEMORY", agentLocal),
@@ -615,8 +644,8 @@ export function createMemoryDistillCommand(
     handler: async (ctx: { args?: string; channel: string }) => {
       const args = (ctx.args ?? "").trim();
       if (!args) {
-        return { 
-          text: `Usage:\n  /memory distill — Force distill current session to LanceDB\n  /memory recall [query] — Search memories by query\n  /memory list [scope] — List memories by scope (owner_shared/agent_local/all)\n  /memory store [text] — Store a single memory immediately`,
+        return {
+          text: `Usage:\n  /memory distill — Force distill current session to LanceDB\n  /memory recall [query] — Search memories by query\n  /memory list [scope] — List memories by scope (owner_shared/agent_local/all)\n  /memory store [text] — Store a single memory immediately\n  /memory consolidate — Merge related memory fragments via LLM\n  /memory profile — Synthesize structured user profile from memories\n  /memory decay — Apply confidence decay to unused memories`,
         };
       }
 
@@ -818,9 +847,76 @@ export function createMemoryDistillCommand(
           }
         }
 
+        case "consolidate": {
+          // Item 1: Memory Consolidation
+          if (!deps.llmCaller) {
+            return { text: "Consolidation unavailable: no LLM caller configured." };
+          }
+
+          const sessionId5 = deps.lastSessionByChannel.get(ctx.channel) ?? [...deps.sessionStates.keys()].at(-1);
+          const session5 = sessionId5 ? deps.sessionStates.get(sessionId5) : undefined;
+          const ownerId5 = session5?.owner?.ownerId ?? "peter";
+          const ownerNamespace5 = session5?.owner?.ownerNamespace ?? "peter";
+
+          try {
+            const result = await consolidateMemories(
+              { storage: deps.storage, embedder: deps.embedder },
+              deps.llmCaller,
+              ownerId5,
+              ownerNamespace5,
+            );
+            return {
+              text: result.groupsMerged > 0
+                ? `Consolidated ${result.consolidated} fragments into ${result.groupsMerged} groups.`
+                : "No memory clusters found for consolidation (need ≥3 related memories).",
+            };
+          } catch (error) {
+            return { text: `Consolidation failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
+          }
+        }
+
+        case "profile": {
+          // Item 4: User Profile Synthesis
+          if (!deps.llmCaller) {
+            return { text: "Profile synthesis unavailable: no LLM caller configured." };
+          }
+
+          const sessionId6 = deps.lastSessionByChannel.get(ctx.channel) ?? [...deps.sessionStates.keys()].at(-1);
+          const session6 = sessionId6 ? deps.sessionStates.get(sessionId6) : undefined;
+          const ownerId6 = session6?.owner?.ownerId ?? "peter";
+          const ownerNamespace6 = session6?.owner?.ownerNamespace ?? "peter";
+
+          try {
+            const result = await synthesizeUserProfile(
+              { storage: deps.storage, embedder: deps.embedder },
+              deps.llmCaller,
+              ownerId6,
+              ownerNamespace6,
+            );
+            if (!result) {
+              return { text: "Not enough memories to synthesize a profile (need ≥3)." };
+            }
+            return { text: `User profile synthesized:\n\n${result.profile}\n\nStored as memory ${result.profileMemoryId.slice(0, 8)}...` };
+          } catch (error) {
+            return { text: `Profile synthesis failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
+          }
+        }
+
+        case "decay": {
+          // Item 3: Manual confidence decay trigger
+          try {
+            const result = await applyConfidenceDecay(
+              { storage: deps.storage, embedder: deps.embedder },
+            );
+            return { text: `Confidence decay applied: ${result.decayed} memories updated.` };
+          } catch (error) {
+            return { text: `Decay failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
+          }
+        }
+
         default:
-          return { 
-            text: `Unknown command: ${command}.\n\nUsage:\n  /memory distill\n  /memory recall [query]\n  /memory list [scope]\n  /memory store [text]`,
+          return {
+            text: `Unknown command: ${command}.\n\nUsage:\n  /memory distill\n  /memory recall [query]\n  /memory list [scope]\n  /memory store [text]\n  /memory consolidate\n  /memory profile\n  /memory decay`,
           };
       }
     },
