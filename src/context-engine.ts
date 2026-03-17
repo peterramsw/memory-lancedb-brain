@@ -1,5 +1,6 @@
 /**
  * Context engine implementation for memory-lancedb-brain
+ * Phase 5: Auto-distill with session lifecycle hooks
  */
 
 import { randomUUID } from "node:crypto";
@@ -35,6 +36,17 @@ export interface SessionState {
   updatedAt: number;
 }
 
+export interface AutoDistillConfig {
+  enabled: boolean;
+  triggers: Array<"onSubagentEnded" | "onSessionEnd" | "onReset" | "onNew">;
+  minStagingLength: number;
+  tokenBudget: number;
+  onSubagentEnded: boolean;
+  onSessionEnd: boolean;
+  onReset: boolean;
+  onNew: boolean;
+}
+
 export interface ContextEngineDeps {
   storage: MemoryStorage;
   embedder: Embedder;
@@ -53,6 +65,7 @@ export interface ContextEngineDeps {
     rerankModel?: string;
     candidatePoolSize?: number;
   };
+  autoDistill?: AutoDistillConfig;
   sessionStates: Map<string, SessionState>;
   sessionKeyIndex: Map<string, string>;
   lastSessionByChannel: Map<string, string>;
@@ -76,6 +89,18 @@ export interface CompactResult {
     details?: unknown;
   };
 }
+
+// Default auto-distill config
+const DEFAULT_AUTO_DISTILL: AutoDistillConfig = {
+  enabled: true,
+  triggers: ["onSubagentEnded", "onSessionEnd", "onReset", "onNew"],
+  minStagingLength: 100,
+  tokenBudget: 30000,
+  onSubagentEnded: true,
+  onSessionEnd: true,
+  onReset: true,
+  onNew: true,
+};
 
 function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
@@ -111,7 +136,7 @@ function extractMessageText(message: AgentMessageLike): string {
 function shouldStageText(text: string): boolean {
   const normalized = text.trim();
   if (!normalized || normalized.length < 40) return false;
-  if (/^(ok|yes|no|收到|好|thanks|謝謝)$/i.test(normalized)) return false;
+  if (/^(ok|yes|no|收到 | 好|thanks|謝謝)$/i.test(normalized)) return false;
   return true;
 }
 
@@ -369,6 +394,38 @@ export async function compactSession(
   };
 }
 
+// Auto-distill check function
+async function checkAndAutoDistill(
+  deps: ContextEngineDeps,
+  session: SessionState,
+  trigger: string,
+): Promise<boolean> {
+  const config = deps.autoDistill ?? DEFAULT_AUTO_DISTILL;
+  
+  if (!config.enabled) {
+    return false;
+  }
+
+  if (!session.sessionFile || session.staging.length < config.minStagingLength) {
+    return false;
+  }
+
+  console.log(`[memory-lancedb-brain] Auto-distill triggered by: ${trigger}, staging length: ${session.staging.length}`);
+  
+  const result = await compactSession(deps, {
+    sessionId: session.sessionId,
+    sessionFile: session.sessionFile,
+    currentTokenCount: 0,
+  });
+
+  if (result.ok && result.compacted) {
+    console.log(`[memory-lancedb-brain] Auto-distill successful: inserted ${(result.result?.details as any)?.insertedCount ?? 0} memories`);
+    return true;
+  }
+
+  return false;
+}
+
 export function createMemoryBrainContextEngine(deps: ContextEngineDeps) {
   return {
     info: {
@@ -482,6 +539,12 @@ export function createMemoryBrainContextEngine(deps: ContextEngineDeps) {
       if (!child) return;
       child.subagentEnded = true;
       deps.sessionStates.set(child.sessionId, child);
+
+      // Auto-distill on subagent ended if enabled
+      const config = deps.autoDistill ?? DEFAULT_AUTO_DISTILL;
+      if (config.onSubagentEnded) {
+        await checkAndAutoDistill(deps, child, "onSubagentEnded");
+      }
 
       if (!child.parentSessionKey) return;
       const parentSessionId = deps.sessionKeyIndex.get(child.parentSessionKey);

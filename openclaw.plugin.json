@@ -59,6 +59,28 @@
           "baseURL": { "type": "string" },
           "apiKey": { "type": "string" }
         }
+      },
+      "autoDistill": {
+        "type": "object",
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "triggers": {
+            "type": "array",
+            "items": { "type": "string", "enum": ["onSubagentEnded", "onSessionEnd", "onReset", "onNew"] }
+          },
+          "minStagingLength": { "type": "number" },
+          "tokenBudget": { "type": "number" },
+          "onSubagentEnded": { "type": "boolean" },
+          "onSessionEnd": { "type": "boolean" },
+          "onReset": { "type": "boolean" },
+          "onNew": { "type": "boolean" }
+        },
+        "default": {
+          "enabled": true,
+          "triggers": ["onSubagentEnded", "onSessionEnd", "onReset", "onNew"],
+          "minStagingLength": 100,
+          "tokenBudget": 30000
+        }
       }
     },
     "required": ["embedding", "dbPath", "owners"]

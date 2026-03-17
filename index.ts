@@ -46,6 +46,16 @@ interface PluginConfig {
     baseURL?: string;
     apiKey?: string;
   };
+  autoDistill?: {
+    enabled?: boolean;
+    triggers?: Array<"onSubagentEnded" | "onSessionEnd" | "onReset" | "onNew">;
+    minStagingLength?: number;
+    tokenBudget?: number;
+    onSubagentEnded?: boolean;
+    onSessionEnd?: boolean;
+    onReset?: boolean;
+    onNew?: boolean;
+  };
 }
 
 const DEFAULT_EMBEDDING: Required<EmbeddingConfig> = {
@@ -138,6 +148,7 @@ export default function register(api: OpenClawPluginApi & { logger?: any; plugin
         owners,
         agentWhitelist,
         retrieval: mergedRetrieval,
+        autoDistill: config.autoDistill as any,
         sessionStates,
         sessionKeyIndex,
         lastSessionByChannel,
