@@ -3,11 +3,12 @@
  * Phase 5: Auto-distill with session lifecycle hooks
  */
 
-import { readFile, readdir } from "node:fs/promises";
+import { readFile, writeFile, readdir } from "node:fs/promises";
 import { dirname, basename, join } from "node:path";
 import type { MemoryRecord, MemoryEventRecord, MemoryScope, MemoryType } from "./schema.js";
 import type { MemoryStorage } from "./storage.js";
-import type { OwnerConfig, ResolvedOwner } from "./owners.js";
+import type { OwnerConfig, ResolvedOwner, ResolveOwnerInput } from "./owners.js";
+import { resolveOwnerFromContext, normalizeOwners } from "./owners.js";
 import type { DistillOutput } from "./distill.js";
 import type { LLMCaller } from "./lifecycle.js";
 import { buildCandidateMemories, processLifecycle, resolveContradictions, applyConfidenceDecay, consolidateMemories, synthesizeUserProfile } from "./lifecycle.js";
@@ -100,6 +101,38 @@ const DEFAULT_AUTO_DISTILL: AutoDistillConfig = {
   onReset: true,
   onNew: true,
 };
+
+/**
+ * Resolve owner from runtimeContext fields or fall back to deps.owners config.
+ * This bridges the gap between what openclaw passes to context engine hooks
+ * (runtimeContext with messageChannel, senderIsOwner, etc.) and what
+ * memory-lancedb-brain needs (ownerId + ownerNamespace).
+ */
+function resolveOwnerFallback(
+  deps: ContextEngineDeps,
+  runtimeContext?: Record<string, unknown>,
+): ResolvedOwner | undefined {
+  // Try resolveOwnerFromContext with runtimeContext fields
+  if (runtimeContext) {
+    const input: ResolveOwnerInput = {
+      senderId: typeof runtimeContext.agentAccountId === "string" ? runtimeContext.agentAccountId : undefined,
+      messageChannel: typeof runtimeContext.messageChannel === "string" ? runtimeContext.messageChannel : undefined,
+      senderIsOwner: typeof runtimeContext.senderIsOwner === "boolean" ? runtimeContext.senderIsOwner : undefined,
+    };
+    const resolved = resolveOwnerFromContext(input, normalizeOwners(deps.owners));
+    if (resolved) return resolved;
+  }
+
+  // Fall back to first configured owner
+  if (deps.owners.length > 0) {
+    return {
+      ownerId: deps.owners[0].owner_id,
+      ownerNamespace: deps.owners[0].owner_namespace,
+    };
+  }
+
+  return undefined;
+}
 
 // Helper functions
 function upsertSessionState(
@@ -402,9 +435,62 @@ async function compactSession(
       candidates,
     );
 
+    // Truncate session file to reduce token count.
+    // Keep header lines (non-message) + compaction summary + recent messages.
+    const tokenBudget = params.currentTokenCount
+      ? Math.floor(params.currentTokenCount * 0.4)  // target 40% of current
+      : 40000;
+    const headerLines: string[] = [];
+    const messageLines: string[] = [];
+    for (const line of lines) {
+      try {
+        const entry = JSON.parse(line);
+        if (entry?.type === "message") {
+          messageLines.push(line);
+        } else {
+          headerLines.push(line);
+        }
+      } catch {
+        headerLines.push(line);
+      }
+    }
+
+    // Keep recent messages within token budget
+    const keptMessages: string[] = [];
+    let keptTokens = 0;
+    for (let i = messageLines.length - 1; i >= 0; i--) {
+      const lineTokens = Math.ceil(messageLines[i].length / 4);
+      if (keptTokens + lineTokens > tokenBudget) break;
+      keptMessages.unshift(messageLines[i]);
+      keptTokens += lineTokens;
+    }
+
+    const droppedCount = messageLines.length - keptMessages.length;
+    if (droppedCount > 0) {
+      // Insert a compaction marker
+      const compactionEntry = JSON.stringify({
+        type: "compaction",
+        id: `compaction-${Date.now()}`,
+        timestamp: new Date().toISOString(),
+        tokensBefore: params.currentTokenCount ?? Math.ceil(sessionContent.length / 4),
+        summary: distillResult.session_summary || "Session compacted by memory-lancedb-brain",
+        droppedMessages: droppedCount,
+        keptMessages: keptMessages.length,
+      });
+
+      const truncatedContent = [
+        ...headerLines,
+        compactionEntry,
+        ...keptMessages,
+      ].join("\n") + "\n";
+
+      await writeFile(resolvedFile, truncatedContent, "utf-8");
+      console.log(`[memory-lancedb-brain] compactSession: truncated session file — dropped ${droppedCount} messages, kept ${keptMessages.length}, ~${keptTokens} tokens`);
+    }
+
     return {
       ok: true,
-      compacted: true,
+      compacted: droppedCount > 0,
       result: {
         summary: distillResult.session_summary || "Session distilled",
         insertedCount: lifecycleResult.inserted,
@@ -413,6 +499,8 @@ async function compactSession(
           merged: lifecycleResult.merged,
           supersedeCandidates: lifecycleResult.supersedeCandidates,
           insertedTypes: lifecycleResult.insertedTypes,
+          droppedMessages: droppedCount,
+          keptMessages: keptMessages.length,
         },
       },
     };
@@ -480,10 +568,14 @@ export function createMemoryBrainContextEngine(deps: ContextEngineDeps) {
 
     async bootstrap(params: { sessionId: string; sessionFile: string }) {
       console.log(`[memory-lancedb-brain] bootstrap: sessionId=${params.sessionId} sessionFile=${params.sessionFile}`);
+      // Resolve owner from plugin config so session state has it for compaction
+      const fallbackOwner = resolveOwnerFallback(deps);
       upsertSessionState(deps, {
         sessionId: params.sessionId,
         sessionKey: params.sessionFile.replace(/\.jsonl$/, ""),
         sessionFile: params.sessionFile,
+        ownerId: fallbackOwner?.ownerId,
+        ownerNamespace: fallbackOwner?.ownerNamespace,
       });
       return { bootstrapped: true, importedMessages: 0 };
     },
@@ -506,12 +598,17 @@ export function createMemoryBrainContextEngine(deps: ContextEngineDeps) {
       messages: AgentMessageLike[];
       prePromptMessageCount: number;
       autoCompactionSummary?: string;
+      runtimeContext?: Record<string, unknown>;
     }) {
       console.log(`[memory-lancedb-brain] afterTurn: sessionId=${params.sessionId} sessionFile=${params.sessionFile} messages=${params.messages.length}`);
+      // Ensure owner is set on session — use runtimeContext or plugin config
+      const ownerForSession = resolveOwnerFallback(deps, params.runtimeContext);
       const session = upsertSessionState(deps, {
         sessionId: params.sessionId,
         sessionKey: params.sessionFile.replace(/\.jsonl$/, ""),
         sessionFile: params.sessionFile,
+        ownerId: ownerForSession?.ownerId,
+        ownerNamespace: ownerForSession?.ownerNamespace,
       });
       for (const message of params.messages.slice(params.prePromptMessageCount)) {
         const text = extractMessageText(message);
@@ -575,7 +672,17 @@ export function createMemoryBrainContextEngine(deps: ContextEngineDeps) {
       force?: boolean;
       currentTokenCount?: number;
       customInstructions?: string;
+      runtimeContext?: Record<string, unknown>;
     }): Promise<CompactResult> {
+      // Ensure owner is set before compaction — last chance to resolve
+      const session = deps.sessionStates.get(params.sessionId);
+      if (session && !session.owner?.ownerId) {
+        const resolved = resolveOwnerFallback(deps, params.runtimeContext);
+        if (resolved) {
+          session.owner = resolved;
+          deps.sessionStates.set(params.sessionId, session);
+        }
+      }
       return compactSession(deps, {
         sessionId: params.sessionId,
         sessionFile: params.sessionFile,
