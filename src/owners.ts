@@ -73,6 +73,9 @@ export function resolveOwnerFromContext(
   }
 
   if (normalizedOwners.length > 0) {
+    // When owners are explicitly configured, always fall back to the first owner.
+    // Do NOT synthesize from senderId/agentId — that would create an ambiguous
+    // "default" namespace tenant outside the configured owner set.
     const owner = normalizedOwners[0];
     return {
       ownerId: owner.owner_id,
@@ -80,6 +83,9 @@ export function resolveOwnerFromContext(
     };
   }
 
+  // No owners configured — synthesize from runtime context as last resort.
+  // This path is only reachable if the plugin is misconfigured (owners is
+  // required in the schema), but we keep it for defensive completeness.
   if (senderId) {
     return {
       ownerId: senderId,

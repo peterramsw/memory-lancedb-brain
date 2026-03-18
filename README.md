@@ -113,6 +113,15 @@ All configuration is set via `plugins.entries.memory-lancedb-brain.config`:
 | `rerankApiKey` | string | — | Reranker API key |
 | `candidatePoolSize` | number | — | Number of candidates to fetch before reranking |
 
+#### Rerank blending formula
+
+When `rerank: true`, the retrieval pipeline first fetches `candidatePoolSize` candidates via hybrid search, then sends them to the cross-encoder reranker. The final score for each candidate is computed as:
+
+- **Reranked candidate**: `rerankScore × 0.6 + originalScore × 0.4`
+- **Unmatched candidate** (not returned by reranker): `originalScore × 0.8`
+
+This blending ensures that the reranker can promote or demote results while the original hybrid score still contributes as a stabilizing signal. Results below `hardMinScore` are dropped after blending.
+
 ### `autoDistill` (optional)
 
 | Field | Type | Default | Description |
@@ -122,9 +131,9 @@ All configuration is set via `plugins.entries.memory-lancedb-brain.config`:
 | `minStagingLength` | number | `3` | Minimum staged messages before distilling |
 | `tokenBudget` | number | `30000` | Max transcript tokens to send to distiller |
 
-### `owners` (optional)
+### `owners` (required)
 
-Array of owner definitions for multi-tenant memory isolation:
+Array of owner definitions for multi-tenant memory isolation. **All memory write operations are fail-closed** — without a valid `owner_id` and `owner_namespace`, distillation, `/memory store`, and compaction will refuse to write. This is a security invariant: memories must always be attributable to a configured owner.
 
 ```json
 [{
@@ -133,6 +142,8 @@ Array of owner definitions for multi-tenant memory isolation:
   "channels": { "telegram:123456": "123456" }
 }]
 ```
+
+The `channels` map binds `<channel>:<senderId>` pairs to this owner. When a message arrives, the plugin resolves the owner by matching `messageChannel` + `senderId` against these bindings. If no channel match is found but `senderIsOwner` is true and there is exactly one owner, that owner is used. As a final fallback (e.g., during compaction where no runtime context is available), the first configured owner is used.
 
 ### `dbPath` (optional)
 

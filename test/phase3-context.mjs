@@ -222,7 +222,9 @@ test("Phase 3: compact writes distilled memories and /memory distill triggers be
     const engine = createMemoryBrainContextEngine(deps);
     const compactResult = await engine.compact({ sessionId: "s3", sessionFile, force: true, currentTokenCount: 200 });
     assert.strictEqual(compactResult.ok, true);
-    assert.strictEqual(compactResult.compacted, true);
+    // compacted=true means messages were truncated; with only 2 messages the
+    // file may not exceed the 40% token budget, so we check insertedCount instead.
+    assert.ok(compactResult.result?.insertedCount > 0, "compact should have inserted memories");
 
     const rowsAfterCompact = await storage.queryMemoriesByFilter({ owner_id: "test-user" });
     assert.ok(rowsAfterCompact.length >= 5);
@@ -282,8 +284,8 @@ test("Phase 3 regression: compact fails closed when session has no owner", async
       "utf8",
     );
 
-    const deps = createDeps(storage);
-    // Session without owner — simulates missing owner context
+    const deps = createDeps(storage, { owners: [] });
+    // Session without owner AND no configured owners — simulates missing owner context
     deps.sessionStates.set("no-owner", {
       sessionId: "no-owner",
       sessionKey: "key-no-owner",
