@@ -21,6 +21,7 @@
       "dbPath": { "type": "string" },
       "owners": {
         "type": "array",
+        "minItems": 1,
         "items": {
           "type": "object",
           "properties": {
@@ -80,11 +81,11 @@
         "default": {
           "enabled": true,
           "triggers": ["onSubagentEnded", "onSessionEnd", "onReset", "onNew"],
-          "minStagingLength": 100,
+          "minStagingLength": 3,
           "tokenBudget": 30000
         }
       }
     },
-    "required": ["embedding", "dbPath", "owners"]
+    "required": ["embedding", "owners"]
   }
 }

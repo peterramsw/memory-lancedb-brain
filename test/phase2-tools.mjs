@@ -9,6 +9,10 @@ import { canAccessScope, resolveOwnerFromContext } from "../src/owners.ts";
 
 const BASE_DB_PATH = "/tmp/memory-lancedb-brain-phase2";
 
+async function safeRm(path) {
+  try { await rm(path, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }); } catch {}
+}
+
 function createFakeEmbedder() {
   return {
     async embed(text) {
@@ -55,7 +59,7 @@ function materializeTools(registrations, runtimeCtx) {
 
 async function setupStorage() {
   const dbPath = `${BASE_DB_PATH}-${randomUUID()}`;
-  await rm(dbPath, { recursive: true, force: true });
+  await safeRm(dbPath);
   await mkdir(dbPath, { recursive: true });
   const storage = await MemoryStorage.connect(dbPath);
   return { dbPath, storage };
@@ -80,7 +84,7 @@ test("Phase 2: tool registration count", async () => {
     });
     assert.strictEqual(api.registrations.length, 6);
   } finally {
-    await rm(dbPath, { recursive: true, force: true });
+    await safeRm(dbPath);
   }
 });
 
@@ -113,7 +117,7 @@ test("Phase 2: memory_store -> memory_recall round-trip", async () => {
     assert.ok(recallResult.details.count >= 1);
     assert.match(recallResult.details.memories[0].content, /Docker/);
   } finally {
-    await rm(dbPath, { recursive: true, force: true });
+    await safeRm(dbPath);
   }
 });
 
@@ -162,7 +166,7 @@ test("Phase 2: memory_update + list + stats + forget", async () => {
     const afterDelete = await tools.get("memory_list").execute("6", { scope: "owner_shared" });
     assert.strictEqual(afterDelete.details.count, 0);
   } finally {
-    await rm(dbPath, { recursive: true, force: true });
+    await safeRm(dbPath);
   }
 });
 
@@ -185,7 +189,7 @@ test("Phase 2: tiffany-customer hard deny for owner_shared", async () => {
     });
     assert.match(denied.content[0].text, /Access denied/);
   } finally {
-    await rm(dbPath, { recursive: true, force: true });
+    await safeRm(dbPath);
   }
 });
 
@@ -232,7 +236,7 @@ test("Phase 2: recall excludes archived and superseded by default", async () => 
     assert.ok(!ids.includes(archived.details.memory_id));
     assert.ok(!ids.includes(superseded.details.memory_id));
   } finally {
-    await rm(dbPath, { recursive: true, force: true });
+    await safeRm(dbPath);
   }
 });
 

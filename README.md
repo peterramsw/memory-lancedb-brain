@@ -69,6 +69,13 @@ openclaw config set plugins.entries.memory-lancedb-brain.config.distillation '{
   "baseURL": "https://api.openai.com/v1",
   "apiKey": "sk-..."
 }'
+
+# Set owner(s) — required for memory isolation
+openclaw config set plugins.entries.memory-lancedb-brain.config.owners '[{
+  "owner_id": "peter",
+  "owner_namespace": "owner_shared",
+  "channels": { "telegram": "123456" }
+}]'
 ```
 
 ### 4. Restart gateway
@@ -113,6 +120,15 @@ All configuration is set via `plugins.entries.memory-lancedb-brain.config`:
 | `rerankApiKey` | string | — | Reranker API key |
 | `candidatePoolSize` | number | — | Number of candidates to fetch before reranking |
 
+#### Rerank blending formula
+
+When `rerank: true`, the retrieval pipeline first fetches `candidatePoolSize` candidates via hybrid search, then sends them to the cross-encoder reranker. The final score for each candidate is computed as:
+
+- **Reranked candidate**: `rerankScore × 0.6 + originalScore × 0.4`
+- **Unmatched candidate** (not returned by reranker): `originalScore × 0.8`
+
+This blending ensures that the reranker can promote or demote results while the original hybrid score still contributes as a stabilizing signal. Results below `hardMinScore` are dropped after blending.
+
 ### `autoDistill` (optional)
 
 | Field | Type | Default | Description |
@@ -122,17 +138,21 @@ All configuration is set via `plugins.entries.memory-lancedb-brain.config`:
 | `minStagingLength` | number | `3` | Minimum staged messages before distilling |
 | `tokenBudget` | number | `30000` | Max transcript tokens to send to distiller |
 
-### `owners` (optional)
+### `owners` (required)
 
-Array of owner definitions for multi-tenant memory isolation:
+Array of owner definitions for multi-tenant memory isolation. **All memory write operations are fail-closed** — without a valid `owner_id` and `owner_namespace`, distillation, `/memory store`, and compaction will refuse to write. This is a security invariant: memories must always be attributable to a configured owner.
 
 ```json
 [{
   "owner_id": "user-1",
   "owner_namespace": "owner_shared",
-  "channels": { "telegram:123456": "123456" }
+  "channels": { "telegram": "123456" }
 }]
 ```
+
+The `channels` map binds incoming messages to owners. Each key is the **channel name** (e.g., `"telegram"`, `"line"`), matching the OpenClaw `messageChannel` field. The value is the **sender's platform ID** (e.g., `"123456"`, `"U1a2b3c"`). The plugin resolves the owner by looking up `owner.channels[messageChannel]` and comparing the value against `senderId`.
+
+When a message arrives, if no channel match is found but `senderIsOwner` is true and there is exactly one owner, that owner is used. As a final fallback (e.g., during compaction where no runtime context is available), the first configured owner is used.
 
 ### `dbPath` (optional)
 
@@ -185,7 +205,12 @@ For self-hosted inference (e.g., with vLLM behind a reverse proxy):
     "rerankModel": "vllm/Forturne/Qwen3-Reranker-4B-NVFP4",
     "rerankEndpoint": "http://127.0.0.1:32080/v1/rerank",
     "rerankApiKey": "local"
-  }
+  },
+  "owners": [{
+    "owner_id": "peter",
+    "owner_namespace": "owner_shared",
+    "channels": { "telegram": "123456" }
+  }]
 }
 ```
 
