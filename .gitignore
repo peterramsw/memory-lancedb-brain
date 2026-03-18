@@ -3,3 +3,4 @@ dist/
 data/
 *.js
 !openclaw.plugin.json
+!test/fixtures.js
