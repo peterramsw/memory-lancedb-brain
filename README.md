@@ -74,7 +74,7 @@ openclaw config set plugins.entries.memory-lancedb-brain.config.distillation '{
 openclaw config set plugins.entries.memory-lancedb-brain.config.owners '[{
   "owner_id": "peter",
   "owner_namespace": "owner_shared",
-  "channels": { "telegram:123456": "123456" }
+  "channels": { "telegram": "123456" }
 }]'
 ```
 
@@ -146,13 +146,13 @@ Array of owner definitions for multi-tenant memory isolation. **All memory write
 [{
   "owner_id": "user-1",
   "owner_namespace": "owner_shared",
-  "channels": { "telegram:123456": "123456" }
+  "channels": { "telegram": "123456" }
 }]
 ```
 
-The `channels` map binds incoming messages to owners. Each key uses the format `<channel>:<senderId>` (e.g., `"telegram:123456"`, `"line:U1a2b3c"`), where `<channel>` matches the OpenClaw `messageChannel` and `<senderId>` matches the sender's platform ID. The value is an arbitrary label (typically the same sender ID).
+The `channels` map binds incoming messages to owners. Each key is the **channel name** (e.g., `"telegram"`, `"line"`), matching the OpenClaw `messageChannel` field. The value is the **sender's platform ID** (e.g., `"123456"`, `"U1a2b3c"`). The plugin resolves the owner by looking up `owner.channels[messageChannel]` and comparing the value against `senderId`.
 
-When a message arrives, the plugin resolves the owner by matching `messageChannel` + `senderId` against these bindings. If no channel match is found but `senderIsOwner` is true and there is exactly one owner, that owner is used. As a final fallback (e.g., during compaction where no runtime context is available), the first configured owner is used.
+When a message arrives, if no channel match is found but `senderIsOwner` is true and there is exactly one owner, that owner is used. As a final fallback (e.g., during compaction where no runtime context is available), the first configured owner is used.
 
 ### `dbPath` (optional)
 
@@ -205,7 +205,12 @@ For self-hosted inference (e.g., with vLLM behind a reverse proxy):
     "rerankModel": "vllm/Forturne/Qwen3-Reranker-4B-NVFP4",
     "rerankEndpoint": "http://127.0.0.1:32080/v1/rerank",
     "rerankApiKey": "local"
-  }
+  },
+  "owners": [{
+    "owner_id": "peter",
+    "owner_namespace": "owner_shared",
+    "channels": { "telegram": "123456" }
+  }]
 }
 ```
 
