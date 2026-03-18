@@ -69,6 +69,13 @@ openclaw config set plugins.entries.memory-lancedb-brain.config.distillation '{
   "baseURL": "https://api.openai.com/v1",
   "apiKey": "sk-..."
 }'
+
+# Set owner(s) — required for memory isolation
+openclaw config set plugins.entries.memory-lancedb-brain.config.owners '[{
+  "owner_id": "peter",
+  "owner_namespace": "owner_shared",
+  "channels": { "telegram:123456": "123456" }
+}]'
 ```
 
 ### 4. Restart gateway
@@ -143,7 +150,9 @@ Array of owner definitions for multi-tenant memory isolation. **All memory write
 }]
 ```
 
-The `channels` map binds `<channel>:<senderId>` pairs to this owner. When a message arrives, the plugin resolves the owner by matching `messageChannel` + `senderId` against these bindings. If no channel match is found but `senderIsOwner` is true and there is exactly one owner, that owner is used. As a final fallback (e.g., during compaction where no runtime context is available), the first configured owner is used.
+The `channels` map binds incoming messages to owners. Each key uses the format `<channel>:<senderId>` (e.g., `"telegram:123456"`, `"line:U1a2b3c"`), where `<channel>` matches the OpenClaw `messageChannel` and `<senderId>` matches the sender's platform ID. The value is an arbitrary label (typically the same sender ID).
+
+When a message arrives, the plugin resolves the owner by matching `messageChannel` + `senderId` against these bindings. If no channel match is found but `senderIsOwner` is true and there is exactly one owner, that owner is used. As a final fallback (e.g., during compaction where no runtime context is available), the first configured owner is used.
 
 ### `dbPath` (optional)
 
