@@ -139,6 +139,7 @@ export async function buildCandidateMemories(
       updated_at: now,
       last_used_at: now,
       source_session_id: session.sessionId,
+      source: "distill",
       embedding,
     });
   }
@@ -472,6 +473,7 @@ export async function consolidateMemories(
           updated_at: Date.now(),
           last_used_at: Date.now(),
           source_session_id: cluster[0].source_session_id,
+          source: "consolidate",
           embedding,
         };
         await deps.storage.insertMemory(newMem);
@@ -576,6 +578,7 @@ Keep it concise — one line per fact. Omit empty sections.`,
       updated_at: Date.now(),
       last_used_at: Date.now(),
       source_session_id: "profile-synthesis",
+      source: "synthesize",
       embedding,
     };
 

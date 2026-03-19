@@ -30,6 +30,7 @@ export interface MemoryRecord {
   updated_at: number; // epoch ms
   last_used_at: number; // epoch ms
   source_session_id: string;
+  source: string; // how this memory was created: "distill" | "manual" | "consolidate" | "synthesize" | "ingest:*"
   embedding: number[]; // dim 2560
 }
 

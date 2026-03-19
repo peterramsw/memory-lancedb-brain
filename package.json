@@ -1,6 +1,6 @@
 {
   "name": "memory-lancedb-brain",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "OpenClaw intelligent memory plugin with structured distillation, lifecycle management, and owner-centric memory boundaries",
   "type": "module",
   "main": "index.ts",

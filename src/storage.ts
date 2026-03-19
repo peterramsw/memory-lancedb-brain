@@ -14,6 +14,7 @@ export interface MemoryFilters {
   memory_scope?: MemoryScope;
   memory_type?: MemoryType;
   status?: MemoryStatus;
+  source?: string;
 }
 
 export interface MemoryTables {
@@ -40,6 +41,7 @@ function buildWhereClause(filters?: MemoryFilters): string | null {
     conditions.push(`memory_type = '${escapeSqlLiteral(filters.memory_type)}'`);
   }
   if (filters.status) conditions.push(`status = '${escapeSqlLiteral(filters.status)}'`);
+  if (filters.source) conditions.push(`source = '${escapeSqlLiteral(filters.source)}'`);
 
   return conditions.length > 0 ? conditions.join(" AND ") : null;
 }
@@ -48,6 +50,7 @@ function normalizeMemoryRecord(record: any): MemoryRecord {
   return {
     ...record,
     tags: typeof record.tags === "string" ? record.tags : JSON.stringify(record.tags ?? []),
+    source: typeof record.source === "string" ? record.source : "unknown",
     embedding: Array.isArray(record.embedding)
       ? record.embedding.map(Number)
       : Array.from(record.embedding ?? [], Number),
@@ -98,6 +101,7 @@ function seedMemoryRecord(): MemoryRecord {
     updated_at: now,
     last_used_at: now,
     source_session_id: "seed",
+    source: "unknown",
     embedding: Array.from({ length: 2560 }, () => 0),
   };
 }
@@ -122,6 +126,17 @@ export async function ensureTables(db: Connection): Promise<MemoryTables> {
 
   try {
     memories = await db.openTable("memories");
+    // Migration: add source column if missing (backward compat with pre-v0.2.0 tables)
+    try {
+      const schema = await memories.schema();
+      const hasSource = schema.fields.some((f: { name: string }) => f.name === "source");
+      if (!hasSource) {
+        await memories.addColumns([{ name: "source", valueSql: "'unknown'" }]);
+        console.log("[memory-lancedb-brain] migration: added 'source' column to existing memories table");
+      }
+    } catch {
+      // Schema introspection or migration not supported in this LanceDB version — skip gracefully
+    }
   } catch {
     memories = await db.createTable("memories", [toTableRow(seedMemoryRecord())]);
     await memories.delete("memory_id = '__seed__'");

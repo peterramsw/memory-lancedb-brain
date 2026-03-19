@@ -256,6 +256,7 @@ function createMemoryStoreTool(core: ToolCoreContext, runtime: ToolRuntimeContex
         updated_at: now,
         last_used_at: now,
         source_session_id: ctx.sessionId,
+        source: "manual",
         embedding,
       };
 

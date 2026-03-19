@@ -942,6 +942,7 @@ export function createMemoryDistillCommand(
               updated_at: now,
               last_used_at: now,
               source_session_id: sessionId,
+              source: "manual",
               embedding,
             };
 
