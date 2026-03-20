@@ -10,15 +10,18 @@ import { createDistiller, createLLMCaller, type DistillerConfig } from "./src/di
 import {
   createMemoryBrainContextEngine,
   createMemoryDistillCommand,
+  type BrainDiagnostics,
   type SessionState,
 } from "./src/context-engine.js";
 import { createEmbedder, type EmbeddingConfig } from "./src/embedding.js";
-import { normalizeOwners, resolveOwnerFromContext } from "./src/owners.js";
+import { normalizeOwners, resolveOwnerFromContext, type ResolvedOwner } from "./src/owners.js";
 import { MemoryStorage } from "./src/storage.js";
 import { registerAllMemoryTools } from "./src/tools.js";
 
 // Process-global state so duplicate plugin inits share maps, storage, and engine.
 const GLOBAL_STATE_KEY = Symbol.for("memory-lancedb-brain.sessionState");
+const PLUGIN_ID = "memory-lancedb-brain";
+const PLUGIN_VERSION = "0.2.3";
 type GlobalState = {
   sessionStates: Map<string, SessionState>;
   sessionKeyIndex: Map<string, string>;
@@ -27,6 +30,7 @@ type GlobalState = {
   // Mutable refs updated on each re-init so event handlers use latest instances
   engine: ReturnType<typeof createMemoryBrainContextEngine> | null;
   storage: MemoryStorage | null;
+  diagnostics: BrainDiagnostics | null;
 };
 function getGlobalState(): GlobalState {
   const g = globalThis as typeof globalThis & { [GLOBAL_STATE_KEY]?: GlobalState };
@@ -38,6 +42,7 @@ function getGlobalState(): GlobalState {
       eventsRegistered: false,
       engine: null,
       storage: null,
+      diagnostics: null,
     };
   }
   return g[GLOBAL_STATE_KEY];
@@ -117,7 +122,13 @@ function upsertSessionState(
     sessionKey: partial.sessionKey ?? existing?.sessionKey,
     agentId: partial.agentId ?? existing?.agentId,
     owner: partial.owner ?? existing?.owner,
+    messageChannel: partial.messageChannel ?? existing?.messageChannel,
+    requesterSenderId: partial.requesterSenderId ?? existing?.requesterSenderId,
+    agentAccountId: partial.agentAccountId ?? existing?.agentAccountId,
+    senderIsOwner: partial.senderIsOwner ?? existing?.senderIsOwner,
     channelId: partial.channelId ?? existing?.channelId,
+    pendingPrompt: partial.pendingPrompt ?? existing?.pendingPrompt,
+    pendingPromptContext: partial.pendingPromptContext ?? existing?.pendingPromptContext,
     sessionFile: partial.sessionFile ?? existing?.sessionFile,
     staging: partial.staging ?? existing?.staging ?? [],
     childSessionKeys: partial.childSessionKeys ?? existing?.childSessionKeys ?? [],
@@ -129,6 +140,64 @@ function upsertSessionState(
   if (next.sessionKey) sessionKeyIndex.set(next.sessionKey, next.sessionId);
   if (next.channelId) lastSessionByChannel.set(next.channelId, next.sessionId);
   return next;
+}
+
+function createDiagnostics(dbPath: string): BrainDiagnostics {
+  return {
+    pluginId: PLUGIN_ID,
+    dbPath,
+    initializedAt: Date.now(),
+    recentWarnings: [],
+    recentErrors: [],
+  };
+}
+
+function pushRecent(list: Array<{ at: number; message: string }>, message: string, max = 8): void {
+  list.push({ at: Date.now(), message });
+  if (list.length > max) list.splice(0, list.length - max);
+}
+
+async function detectTrustedPluginAllowance(pluginId: string): Promise<boolean | undefined> {
+  try {
+    const home = process.env.HOME;
+    if (!home) return undefined;
+    const { readFile } = await import("node:fs/promises");
+    const content = await readFile(join(home, ".openclaw", "openclaw.json"), "utf8");
+    const parsed = JSON.parse(content);
+    const allow = parsed?.plugins?.allow;
+    if (!Array.isArray(allow)) return undefined;
+    return allow.includes(pluginId);
+  } catch {
+    return undefined;
+  }
+}
+
+function resolveHookContext(ctx: any = {}, event: any = {}) {
+  return {
+    sessionId: event?.sessionId ?? ctx?.sessionId,
+    sessionKey: event?.sessionKey ?? ctx?.sessionKey,
+    agentId: event?.agentId ?? ctx?.agentId,
+    channelId: ctx?.channelId,
+    messageChannel: ctx?.messageChannel,
+    requesterSenderId: ctx?.requesterSenderId,
+    agentAccountId: ctx?.agentAccountId,
+    senderIsOwner: typeof ctx?.senderIsOwner === "boolean" ? ctx.senderIsOwner : undefined,
+  };
+}
+
+function resolveHookOwner(
+  owners: ReturnType<typeof normalizeOwners>,
+  runtimeCtx: ReturnType<typeof resolveHookContext>,
+): ResolvedOwner | undefined {
+  return resolveOwnerFromContext(
+    {
+      senderId: runtimeCtx.requesterSenderId ?? runtimeCtx.agentAccountId,
+      messageChannel: runtimeCtx.messageChannel,
+      agentId: runtimeCtx.agentId,
+      senderIsOwner: runtimeCtx.senderIsOwner,
+    },
+    owners,
+  ) ?? (owners[0] ? { ownerId: owners[0].owner_id, ownerNamespace: owners[0].owner_namespace } : undefined);
 }
 
 export default function register(api: OpenClawPluginApi & { logger?: any; pluginConfig?: unknown; on?: Function }): void {
@@ -150,6 +219,9 @@ export default function register(api: OpenClawPluginApi & { logger?: any; plugin
       const gs = getGlobalState();
       // Reuse storage across plugin re-inits to avoid stale LanceDB table handles
       const storage = gs.storage ?? await MemoryStorage.connect(dbPath);
+      const diagnostics = gs.diagnostics ?? createDiagnostics(dbPath);
+      diagnostics.dbPath = dbPath;
+      diagnostics.trustedPluginExplicit = await detectTrustedPluginAllowance(PLUGIN_ID);
       const embedder = createEmbedder(embeddingConfig);
       const distiller = createDistiller(distillationConfig);
       const llmCaller = createLLMCaller(distillationConfig);
@@ -165,6 +237,10 @@ export default function register(api: OpenClawPluginApi & { logger?: any; plugin
         owners,
         agentWhitelist,
         retrieval: mergedRetrieval,
+        diagnostics,
+        dbPath,
+        pluginId: PLUGIN_ID,
+        pluginVersion: PLUGIN_VERSION,
       });
 
       const engine = createMemoryBrainContextEngine({
@@ -179,13 +255,15 @@ export default function register(api: OpenClawPluginApi & { logger?: any; plugin
         sessionStates,
         sessionKeyIndex,
         lastSessionByChannel,
+        diagnostics,
       });
 
       // Update global refs so event handlers always use the latest instances
       gs.engine = engine;
       gs.storage = storage;
+      gs.diagnostics = diagnostics;
 
-      api.registerContextEngine?.("memory-lancedb-brain", () => engine);
+      api.registerContextEngine?.(PLUGIN_ID, () => engine);
       api.registerCommand?.(createMemoryDistillCommand({
         storage,
         embedder,
@@ -197,62 +275,115 @@ export default function register(api: OpenClawPluginApi & { logger?: any; plugin
         sessionStates,
         sessionKeyIndex,
         lastSessionByChannel,
+        diagnostics,
       }, engine));
 
       // Only register event handlers once (plugin may re-initialize but api.on accumulates)
       if (!gs.eventsRegistered) {
         gs.eventsRegistered = true;
 
-        api.on?.("before_prompt_build", (_event: unknown, ctx: any) => {
-          if (!ctx?.sessionId) return;
-          const owner = resolveOwnerFromContext(
-            {
-              senderId: undefined,
-              messageChannel: ctx.channelId,
-              agentId: ctx.agentId,
-              senderIsOwner: true,
-            },
-            owners,
-          ) ?? (owners[0] ? { ownerId: owners[0].owner_id, ownerNamespace: owners[0].owner_namespace } : undefined);
-
+        const capturePendingPrompt = (event: any, ctx: any) => {
+          const runtimeCtx = resolveHookContext(ctx);
+          if (!runtimeCtx.sessionId) return;
+          const owner = resolveHookOwner(owners, runtimeCtx);
+          const prompt = typeof event?.prompt === "string" ? event.prompt : undefined;
           upsertSessionState(sessionStates, sessionKeyIndex, lastSessionByChannel, {
-            sessionId: ctx.sessionId,
-            sessionKey: ctx.sessionKey,
-            agentId: ctx.agentId,
+            sessionId: runtimeCtx.sessionId,
+            sessionKey: runtimeCtx.sessionKey,
+            agentId: runtimeCtx.agentId,
             owner,
-            channelId: ctx.channelId,
+            messageChannel: runtimeCtx.messageChannel,
+            requesterSenderId: runtimeCtx.requesterSenderId,
+            agentAccountId: runtimeCtx.agentAccountId,
+            senderIsOwner: runtimeCtx.senderIsOwner,
+            channelId: runtimeCtx.channelId,
+            pendingPrompt: prompt,
           });
+        };
+
+        api.on?.("before_model_resolve", capturePendingPrompt);
+        api.on?.("before_agent_start", capturePendingPrompt);
+
+        api.on?.("before_prompt_build", (_event: unknown, ctx: any) => {
+          const runtimeCtx = resolveHookContext(ctx);
+          if (!runtimeCtx.sessionId) return;
+          const owner = resolveHookOwner(owners, runtimeCtx);
+
+          const session = upsertSessionState(sessionStates, sessionKeyIndex, lastSessionByChannel, {
+            sessionId: runtimeCtx.sessionId,
+            sessionKey: runtimeCtx.sessionKey,
+            agentId: runtimeCtx.agentId,
+            owner,
+            messageChannel: runtimeCtx.messageChannel,
+            requesterSenderId: runtimeCtx.requesterSenderId,
+            agentAccountId: runtimeCtx.agentAccountId,
+            senderIsOwner: runtimeCtx.senderIsOwner,
+            channelId: runtimeCtx.channelId,
+          });
+
+          const prependContext = session.pendingPromptContext?.trim();
+          if (!prependContext) return;
+          session.pendingPromptContext = undefined;
+          sessionStates.set(session.sessionId, session);
+          return { prependContext };
         });
 
         api.on?.("session_start", (event: any, ctx: any) => {
-          if (!event?.sessionId) return;
+          const runtimeCtx = resolveHookContext(ctx, event);
+          if (!runtimeCtx.sessionId) return;
+          const owner = resolveHookOwner(owners, runtimeCtx);
           upsertSessionState(sessionStates, sessionKeyIndex, lastSessionByChannel, {
-            sessionId: event.sessionId,
-            sessionKey: event.sessionKey ?? ctx?.sessionKey,
-            agentId: ctx?.agentId,
-            channelId: ctx?.channelId,
-            owner: owners[0] ? { ownerId: owners[0].owner_id, ownerNamespace: owners[0].owner_namespace } : undefined,
+            sessionId: runtimeCtx.sessionId,
+            sessionKey: runtimeCtx.sessionKey,
+            agentId: runtimeCtx.agentId,
+            owner,
+            messageChannel: runtimeCtx.messageChannel,
+            requesterSenderId: runtimeCtx.requesterSenderId,
+            agentAccountId: runtimeCtx.agentAccountId,
+            senderIsOwner: runtimeCtx.senderIsOwner,
+            channelId: runtimeCtx.channelId,
           });
         });
 
-        api.on?.("subagent_spawned", (event: any) => {
+        api.on?.("subagent_spawned", (event: any, ctx: any) => {
           if (!event?.childSessionKey || !event?.runId) return;
           const sessionId = sessionKeyIndex.get(event.childSessionKey) ?? event.childSessionKey;
+          const runtimeCtx = resolveHookContext(ctx, event);
+          const owner = resolveHookOwner(owners, runtimeCtx);
           upsertSessionState(sessionStates, sessionKeyIndex, lastSessionByChannel, {
             sessionId,
             sessionKey: event.childSessionKey,
-            agentId: event.agentId,
-            owner: owners[0] ? { ownerId: owners[0].owner_id, ownerNamespace: owners[0].owner_namespace } : undefined,
+            agentId: runtimeCtx.agentId,
+            owner,
+            messageChannel: runtimeCtx.messageChannel,
+            requesterSenderId: runtimeCtx.requesterSenderId,
+            agentAccountId: runtimeCtx.agentAccountId,
+            senderIsOwner: runtimeCtx.senderIsOwner,
+            channelId: runtimeCtx.channelId,
           });
         });
 
         // Auto-distill when session ends (triggered by /new, /reset, idle timeout)
-        api.on?.("session_end", async (event: any, _ctx: any) => {
-          if (!event?.sessionId) return;
-          const session = sessionStates.get(event.sessionId);
+        api.on?.("session_end", async (event: any, ctx: any) => {
+          const runtimeCtx = resolveHookContext(ctx, event);
+          if (!runtimeCtx.sessionId) return;
+          let session = sessionStates.get(runtimeCtx.sessionId);
           if (!session) {
-            api.logger?.warn?.(`memory-lancedb-brain: session_end ignored — no session state for ${event.sessionId}`);
-            return;
+            const owner = resolveHookOwner(owners, runtimeCtx);
+            session = upsertSessionState(sessionStates, sessionKeyIndex, lastSessionByChannel, {
+              sessionId: runtimeCtx.sessionId,
+              sessionKey: runtimeCtx.sessionKey,
+              agentId: runtimeCtx.agentId,
+              owner,
+              messageChannel: runtimeCtx.messageChannel,
+              requesterSenderId: runtimeCtx.requesterSenderId,
+              agentAccountId: runtimeCtx.agentAccountId,
+              senderIsOwner: runtimeCtx.senderIsOwner,
+              channelId: runtimeCtx.channelId,
+            });
+            const warn = `memory-lancedb-brain: session_end reconstructed missing session state for ${runtimeCtx.sessionId}`;
+            pushRecent(diagnostics.recentWarnings, warn);
+            api.logger?.warn?.(warn);
           }
 
           // Resolve sessionFile: prefer state, fallback to filesystem
@@ -273,14 +404,18 @@ export default function register(api: OpenClawPluginApi & { logger?: any; plugin
           }
 
           if (!sessionFile) {
-            api.logger?.warn?.(`memory-lancedb-brain: session_end skipped — no sessionFile for ${event.sessionId} (sessionKey=${session.sessionKey})`);
+            const warn = `memory-lancedb-brain: session_end skipped — no sessionFile for ${runtimeCtx.sessionId} (sessionKey=${session.sessionKey})`;
+            pushRecent(diagnostics.recentWarnings, warn);
+            api.logger?.warn?.(warn);
             return;
           }
 
           try {
             const currentEngine = gs.engine;
             if (!currentEngine) {
-              api.logger?.warn?.(`memory-lancedb-brain: session_end skipped — engine not initialized`);
+              const warn = "memory-lancedb-brain: session_end skipped — engine not initialized";
+              pushRecent(diagnostics.recentWarnings, warn);
+              api.logger?.warn?.(warn);
               return;
             }
             const result = await currentEngine.compact({
@@ -291,10 +426,14 @@ export default function register(api: OpenClawPluginApi & { logger?: any; plugin
             if (result.ok && result.compacted) {
               api.logger?.info?.(`memory-lancedb-brain: auto-distill on session_end OK for ${event.sessionId}: inserted ${result.result?.insertedCount ?? 0} memories`);
             } else {
-              api.logger?.warn?.(`memory-lancedb-brain: auto-distill on session_end no-op for ${event.sessionId}: ${result.reason ?? "no memories"}`);
+              const warn = `memory-lancedb-brain: auto-distill on session_end no-op for ${event.sessionId}: ${result.reason ?? "no memories"}`;
+              pushRecent(diagnostics.recentWarnings, warn);
+              api.logger?.warn?.(warn);
             }
           } catch (err) {
-            api.logger?.warn?.(`memory-lancedb-brain: auto-distill failed on session_end: ${err}`);
+            const warn = `memory-lancedb-brain: auto-distill failed on session_end: ${String(err)}`;
+            pushRecent(diagnostics.recentErrors, warn);
+            api.logger?.warn?.(warn);
           }
         });
       }
@@ -310,8 +449,15 @@ export default function register(api: OpenClawPluginApi & { logger?: any; plugin
         sessionStates,
         sessionKeyIndex,
         lastSessionByChannel,
+        diagnostics,
       };
 
+      if (diagnostics.trustedPluginExplicit === false) {
+        pushRecent(
+          diagnostics.recentWarnings,
+          "trusted plugin loading is not explicit; plugins.allow does not include memory-lancedb-brain",
+        );
+      }
       api.logger?.info?.(`memory-lancedb-brain: Phase 3 initialized (db=${dbPath})`);
     } catch (error) {
       api.logger?.error?.(`memory-lancedb-brain: initialization failed: ${String(error)}`);

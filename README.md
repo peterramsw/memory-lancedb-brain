@@ -2,7 +2,9 @@
 
 OpenClaw plugin for persistent, intelligent long-term memory backed by [LanceDB](https://lancedb.com/).
 
-Conversations are automatically distilled into structured memories (facts, preferences, decisions, etc.) using an LLM, stored with vector embeddings, and injected into future prompts via semantic search — giving agents cross-session recall without manual `/memory` commands.
+Conversations are automatically distilled into structured memories (facts, preferences, decisions, etc.) using an LLM, stored with vector embeddings, and injected into future prompts via semantic search — giving agents cross-session and cross-agent recall without manual `/memory` commands.
+
+Distillation is best-effort rather than brittle: startup/session boilerplate is sanitized before compaction, transcript size is bounded by `autoDistill.tokenBudget`, and heuristic fallback is designed to preserve useful user-stated facts when the LLM distiller path fails.
 
 ## Features
 
@@ -12,6 +14,11 @@ Conversations are automatically distilled into structured memories (facts, prefe
 - **Multi-owner isolation** — Owner-scoped memories shared across agents, plus agent-local memories
 - **Context engine integration** — Registers as an openclaw context engine; memories are automatically assembled into system prompts
 - **Auto-distill** — Triggers on session end, `/new`, `/reset`, or subagent completion
+- **Transcript hygiene + bounded distill budget** — Compact/distill strips startup boilerplate, untrusted metadata, and command noise before sending the transcript to the distiller
+- **Fallback fact preservation** — If LLM distillation fails, heuristic fallback still keeps user-stated operational facts and future plans instead of persisting startup/session boilerplate
+- **Status affordance** — `memory_status` reports loaded state, DB path, recent assemble/compact evidence, and explains that brain runs in-process inside `openclaw-gateway`
+- **Legacy markdown migration** — `/memory import-legacy [path]` imports existing markdown memory notes into LanceDB with sanitization and rerun-safe dedupe
+- **No-reset memory contract** — For memory-intent queries with no hit, brain injects a contract that says no relevant long-term memory was found, instead of implying all memory was wiped by `/new` or restart
 
 ## Architecture
 
@@ -83,6 +90,22 @@ openclaw config set plugins.entries.memory-lancedb-brain.config.owners '[{
 ```bash
 systemctl --user restart openclaw-gateway.service
 ```
+
+### 5. Migrate existing markdown memory notes (recommended for post-install adoption)
+
+If this OpenClaw workspace already has legacy markdown memory files, import them once after installing brain:
+
+```bash
+/memory import-legacy ~/.openclaw/workspace/memory
+```
+
+You can also import a single file:
+
+```bash
+/memory import-legacy ~/.openclaw/workspace/MEMORY.md
+```
+
+Rerunning the same import is safe: unchanged files are skipped, and changed files supersede the previous imported version instead of creating duplicate active memories.
 
 ## Configuration Reference
 
@@ -180,7 +203,32 @@ Once configured, the plugin works automatically:
 /memory recall <query>   Search memories by semantic query
 /memory list [scope]     List memories (owner_shared / agent_local / all)
 /memory store <text>     Store a single memory immediately
+/memory import-legacy [path]  Import legacy markdown notes into LanceDB
+/memory migrate-legacy [path] Alias of import-legacy
 ```
+
+### Agent tools
+
+The plugin exposes seven tools:
+
+- `memory_recall`
+- `memory_store`
+- `memory_forget`
+- `memory_update`
+- `memory_list`
+- `memory_stats`
+- `memory_status`
+
+`memory_status` is the canonical operator/agent health check. It reports whether the plugin is loaded, which owner/scopes are active for the current runtime context, recent assemble/afterTurn/compact evidence, and a reminder that no standalone LanceDB process/container is expected because brain is an in-process OpenClaw plugin.
+
+## Migration Notes
+
+`memory-lancedb-brain` is designed for the common case where users install brain after already using OpenClaw for a while.
+
+- Legacy markdown notes can be imported from a whole directory or a single `.md` file.
+- Known delivery noise such as `Conversation info (untrusted metadata)` and startup boilerplate is stripped before import.
+- Imported records are stored with `source = "ingest:legacy-markdown"`.
+- Re-running import against unchanged files skips them; changed files supersede the previous imported version.
 
 ## Example: Local vLLM Setup
 

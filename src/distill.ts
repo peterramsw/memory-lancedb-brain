@@ -51,6 +51,25 @@ function ensureArrayOfStrings(value: unknown): string[] {
   return value.map((item) => String(item ?? "").trim()).filter(Boolean);
 }
 
+function isSyntheticStartupText(text: string): boolean {
+  const trimmed = text.trim();
+  return trimmed.includes("A new session was started via /new or /reset")
+    && trimmed.includes("Execute your Session Startup sequence now");
+}
+
+function sanitizeTranscriptLine(text: string): string {
+  let stripped = text.replace(/\r\n/g, "\n");
+  stripped = stripped.replace(/Conversation info \(untrusted metadata\):\s*```json[\s\S]*?```\s*/gi, "");
+  stripped = stripped.replace(/Sender \(untrusted metadata\):\s*```json[\s\S]*?```\s*/gi, "");
+  stripped = stripped.replace(/^\[[^\]]*GMT[^\]]*\]\s*/gm, "");
+  stripped = stripped.trim();
+  if (!stripped) return "";
+  if (stripped === "(session bootstrap)") return "";
+  if (isSyntheticStartupText(stripped)) return "";
+  if (stripped.startsWith("/") && !stripped.includes(":")) return "";
+  return stripped;
+}
+
 function normalizeOutput(payload: Partial<DistillOutput> | null | undefined): DistillOutput {
   const scope = payload?.scope_recommendation;
   return {
@@ -104,15 +123,34 @@ export function heuristicDistill(transcript: string): DistillOutput {
   // Only extract from USER lines, not assistant lines
   const userLines = lines
     .filter((line) => /^user:\s*/i.test(line))
-    .map((line) => line.replace(/^user:\s*/i, "").trim())
+    .map((line) => sanitizeTranscriptLine(line.replace(/^user:\s*/i, "").trim()))
     .filter((line) => line.length > 5);
 
-  const summary = userLines.slice(-6).join("; ").slice(0, 500) || lines.slice(-6).join("; ").slice(0, 500);
+  const sanitizedLines = lines
+    .map((line) => {
+      const match = line.match(/^(user|assistant):\s*(.*)$/i);
+      if (!match) return "";
+      const cleaned = sanitizeTranscriptLine(match[2] ?? "");
+      if (!cleaned) return "";
+      return `${match[1].toLowerCase()}: ${cleaned}`;
+    })
+    .filter(Boolean);
+
+  const summary = userLines.slice(-6).join("; ").slice(0, 500) || sanitizedLines.slice(-6).join("; ").slice(0, 500);
 
   // Extract facts: statements containing possessive/ownership/identity patterns
   const facts = userLines
     .filter((line) => /我[的有是在]|我叫|我用|my |i have|i am|i use|我們|名字/i.test(line))
     .map((line) => `用戶: ${line.slice(0, 200)}`)
+    .slice(0, 5);
+
+  const operationalFacts = userLines
+    .filter((line) => {
+      if (/[?？]$/.test(line)) return false;
+      return /(?:今天|明天|後天|本週|這週|下週|下星期|今晚|稍後).*(?:要|會|需要|安排|去|到|處理|開會)/.test(line)
+        || /(?:要去|會去|需要去|安排.*去|安排.*到)/.test(line);
+    })
+    .map((line) => `用戶提供的工作安排: ${line.slice(0, 200)}`)
     .slice(0, 5);
 
   // Extract preferences: likes, preferences, habits
@@ -142,6 +180,14 @@ export function heuristicDistill(transcript: string): DistillOutput {
   // Extract todos
   const todos = userLines
     .filter((line) => /待辦|todo|接下來|next|需要|之後|later|還沒/i.test(line))
+    .map((line) => line.slice(0, 200))
+    .slice(0, 3);
+
+  const scheduleLoops = userLines
+    .filter((line) => {
+      if (/[?？]$/.test(line)) return false;
+      return /(?:今天|明天|後天|下週|下星期).*(?:要|會|需要|安排|處理|去|到)/.test(line);
+    })
     .map((line) => line.slice(0, 200))
     .slice(0, 3);
 
@@ -179,12 +225,12 @@ export function heuristicDistill(transcript: string): DistillOutput {
   return normalizeOutput({
     ...DEFAULT_OUTPUT,
     session_summary: summary,
-    confirmed_facts: facts,
+    confirmed_facts: [...facts, ...operationalFacts],
     decisions,
     pitfalls,
     preference_updates: preferences,
     environment_truths: envTruths,
-    open_loops: todos,
+    open_loops: [...todos, ...scheduleLoops],
     corrections,
     best_practices: bestPractices,
     style_observations: styleObs,
@@ -306,11 +352,11 @@ export function createDistiller(config: DistillerConfig) {
 
   return {
     async distillTranscript(transcript: string, opts?: { customInstructions?: string }): Promise<DistillOutput> {
-      if (resolved.distillImpl) {
-        return normalizeOutput(await resolved.distillImpl(transcript, opts));
-      }
-
       try {
+        if (resolved.distillImpl) {
+          return normalizeOutput(await resolved.distillImpl(transcript, opts));
+        }
+
         const userPrompt = `${opts?.customInstructions ? `${opts.customInstructions}\n\n` : ""}Distill the following conversation into structured memory JSON. Extract ONLY what the USER said or confirmed:\n\n${transcript}`;
         const raw = await callChatCompletionsInternal(resolved, DISTILL_SYSTEM_PROMPT, userPrompt);
         const parsed = parseDistillJson(raw);

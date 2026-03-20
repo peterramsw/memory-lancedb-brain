@@ -81,8 +81,18 @@ test("Phase 2: tool registration count", async () => {
       ],
       agentWhitelist: ["main", "plaw-coding-team", "tiffany-ops"],
       retrieval: { mode: "hybrid" },
+      diagnostics: {
+        pluginId: "memory-lancedb-brain",
+        dbPath,
+        initializedAt: Date.now(),
+        recentWarnings: [],
+        recentErrors: [],
+      },
+      dbPath,
+      pluginId: "memory-lancedb-brain",
+      pluginVersion: "0.2.1",
     });
-    assert.strictEqual(api.registrations.length, 6);
+    assert.strictEqual(api.registrations.length, 7);
   } finally {
     await safeRm(dbPath);
   }
@@ -248,4 +258,55 @@ test("Phase 2: owner mapping helper + whitelist helper", async () => {
   assert.deepStrictEqual(owner, { ownerId: "test-user", ownerNamespace: "personal" });
   assert.strictEqual(canAccessScope("main", "owner_shared", ["main"]), true);
   assert.strictEqual(canAccessScope("tiffany-customer", "owner_shared", ["tiffany-customer"]), false);
+});
+
+test("Phase 2: memory_status reports in-process brain diagnostics", async () => {
+  const { dbPath, storage } = await setupStorage();
+  try {
+    const api = makeMockApi();
+    registerAllMemoryTools(api, {
+      storage,
+      embedder: createFakeEmbedder(),
+      owners: [{ owner_id: "test-user", owner_namespace: "personal", channels: { telegram: "0000000000" } }],
+      agentWhitelist: ["main", "plaw-coding-team", "tiffany-ops"],
+      retrieval: { mode: "hybrid", minScore: 0.1, hardMinScore: 0.05 },
+      diagnostics: {
+        pluginId: "memory-lancedb-brain",
+        dbPath,
+        initializedAt: Date.now(),
+        trustedPluginExplicit: true,
+        recentWarnings: [],
+        recentErrors: [],
+        lastAssemble: {
+          at: Date.now(),
+          sessionId: "session-status",
+          agentId: "main",
+          ownerId: "test-user",
+          query: "昨天 Docker 怎麼部署",
+          ownerSharedCount: 2,
+          agentLocalCount: 0,
+        },
+      },
+      dbPath,
+      pluginId: "memory-lancedb-brain",
+      pluginVersion: "0.2.1",
+    });
+    const tools = materializeTools(api.registrations, createRuntime("main"));
+
+    await tools.get("memory_store").execute("1", {
+      text: "Docker runs on GB10 and Windows uses Docker Desktop",
+      importance: 4,
+      scope: "owner_shared",
+      category: "fact",
+    });
+
+    const status = await tools.get("memory_status").execute("2", {});
+    assert.match(status.content[0].text, /in-process OpenClaw plugin/);
+    assert.strictEqual(status.details.loaded, true);
+    assert.strictEqual(status.details.inProcessPlugin, true);
+    assert.strictEqual(status.details.trustedPluginExplicit, true);
+    assert.ok(status.details.countsByAccessibleScope.owner_shared >= 1);
+  } finally {
+    await safeRm(dbPath);
+  }
 });

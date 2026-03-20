@@ -13,6 +13,7 @@ import type { DistillOutput } from "./distill.js";
 import type { LLMCaller } from "./lifecycle.js";
 import { buildCandidateMemories, processLifecycle, resolveContradictions, applyConfidenceDecay, consolidateMemories, synthesizeUserProfile } from "./lifecycle.js";
 import type { Embedder } from "./embedding.js";
+import { importLegacyMarkdown } from "./legacy-import.js";
 
 export interface AgentMessageLike {
   role?: string;
@@ -29,12 +30,62 @@ export interface SessionState {
   sessionFile?: string;
   agentId?: string;
   owner?: ResolvedOwner;
+  messageChannel?: string;
+  requesterSenderId?: string;
+  agentAccountId?: string;
+  senderIsOwner?: boolean;
   channelId?: string;
+  pendingPrompt?: string;
+  pendingPromptContext?: string;
   staging: string[];
   childSessionKeys: string[];
   parentSessionKey?: string;
   subagentEnded?: boolean;
   updatedAt: number;
+}
+
+export interface BrainDiagnostics {
+  pluginId: string;
+  dbPath: string;
+  initializedAt: number;
+  trustedPluginExplicit?: boolean;
+  recentWarnings: Array<{ at: number; message: string }>;
+  recentErrors: Array<{ at: number; message: string }>;
+  lastBootstrap?: {
+    at: number;
+    sessionId: string;
+    sessionFile?: string;
+    agentId?: string;
+    ownerId?: string;
+    ownerNamespace?: string;
+  };
+  lastAssemble?: {
+    at: number;
+    sessionId: string;
+    agentId?: string;
+    ownerId?: string;
+    query: string;
+    ownerSharedCount: number;
+    agentLocalCount: number;
+    skipped?: boolean;
+    reason?: string;
+  };
+  lastAfterTurn?: {
+    at: number;
+    sessionId: string;
+    sessionFile?: string;
+    agentId?: string;
+    ownerId?: string;
+    stagedCount: number;
+  };
+  lastCompact?: {
+    at: number;
+    sessionId: string;
+    ok: boolean;
+    compacted: boolean;
+    insertedCount?: number;
+    reason?: string;
+  };
 }
 
 export interface AutoDistillConfig {
@@ -71,6 +122,7 @@ export interface ContextEngineDeps {
   sessionStates: Map<string, SessionState>;
   sessionKeyIndex: Map<string, string>;
   lastSessionByChannel: Map<string, string>;
+  diagnostics?: BrainDiagnostics;
 }
 
 export interface AssembleResult {
@@ -114,9 +166,14 @@ function resolveOwnerFallback(
 ): ResolvedOwner | undefined {
   // Try resolveOwnerFromContext with runtimeContext fields
   if (runtimeContext) {
+    const requesterSenderId =
+      typeof runtimeContext.requesterSenderId === "string" ? runtimeContext.requesterSenderId : undefined;
+    const agentAccountId =
+      typeof runtimeContext.agentAccountId === "string" ? runtimeContext.agentAccountId : undefined;
     const input: ResolveOwnerInput = {
-      senderId: typeof runtimeContext.agentAccountId === "string" ? runtimeContext.agentAccountId : undefined,
+      senderId: requesterSenderId ?? agentAccountId,
       messageChannel: typeof runtimeContext.messageChannel === "string" ? runtimeContext.messageChannel : undefined,
+      agentId: typeof runtimeContext.agentId === "string" ? runtimeContext.agentId : undefined,
       senderIsOwner: typeof runtimeContext.senderIsOwner === "boolean" ? runtimeContext.senderIsOwner : undefined,
     };
     const resolved = resolveOwnerFromContext(input, normalizeOwners(deps.owners));
@@ -134,6 +191,22 @@ function resolveOwnerFallback(
   return undefined;
 }
 
+function pushRecent(list: Array<{ at: number; message: string }> | undefined, message: string, max = 8): void {
+  if (!list) return;
+  list.push({ at: Date.now(), message });
+  if (list.length > max) list.splice(0, list.length - max);
+}
+
+function recordWarning(deps: ContextEngineDeps, message: string): void {
+  pushRecent(deps.diagnostics?.recentWarnings, message);
+  console.warn(`[memory-lancedb-brain] ${message}`);
+}
+
+function recordError(deps: ContextEngineDeps, message: string): void {
+  pushRecent(deps.diagnostics?.recentErrors, message);
+  console.error(`[memory-lancedb-brain] ${message}`);
+}
+
 // Helper functions
 function upsertSessionState(
   deps: ContextEngineDeps,
@@ -144,8 +217,14 @@ function upsertSessionState(
     agentId?: string;
     ownerId?: string;
     ownerNamespace?: string;
+    messageChannel?: string;
+    requesterSenderId?: string;
+    agentAccountId?: string;
+    senderIsOwner?: boolean;
     channelId?: string;
     parentSessionKey?: string;
+    pendingPrompt?: string;
+    pendingPromptContext?: string;
   },
 ): SessionState {
   const existing = deps.sessionStates.get(params.sessionId);
@@ -154,7 +233,13 @@ function upsertSessionState(
     if (params.sessionFile) existing.sessionFile = params.sessionFile;
     if (params.sessionKey) existing.sessionKey = params.sessionKey;
     if (params.agentId) existing.agentId = params.agentId;
+    if (params.messageChannel) existing.messageChannel = params.messageChannel;
+    if (params.requesterSenderId) existing.requesterSenderId = params.requesterSenderId;
+    if (params.agentAccountId) existing.agentAccountId = params.agentAccountId;
+    if (typeof params.senderIsOwner === "boolean") existing.senderIsOwner = params.senderIsOwner;
     if (params.channelId) existing.channelId = params.channelId;
+    if (typeof params.pendingPrompt === "string") existing.pendingPrompt = params.pendingPrompt;
+    if (typeof params.pendingPromptContext === "string") existing.pendingPromptContext = params.pendingPromptContext;
     if (params.ownerId && params.ownerNamespace) {
       existing.owner = { ownerId: params.ownerId, ownerNamespace: params.ownerNamespace };
     }
@@ -170,7 +255,13 @@ function upsertSessionState(
     owner: params.ownerId && params.ownerNamespace
       ? { ownerId: params.ownerId, ownerNamespace: params.ownerNamespace }
       : undefined,
+    messageChannel: params.messageChannel,
+    requesterSenderId: params.requesterSenderId,
+    agentAccountId: params.agentAccountId,
+    senderIsOwner: params.senderIsOwner,
     channelId: params.channelId,
+    pendingPrompt: params.pendingPrompt,
+    pendingPromptContext: params.pendingPromptContext,
     staging: [],
     childSessionKeys: [],
     parentSessionKey: params.parentSessionKey,
@@ -190,6 +281,7 @@ function upsertSessionState(
 function extractMessageText(message: AgentMessageLike | any): string {
   if (!message) return "";
   if (typeof message === "string") return message;
+  if (message.role === "tool" || message.type === "toolCall" || message.type === "toolResult") return "";
   if (message.text) return typeof message.text === "string" ? message.text : String(message.text);
   if (message.content) {
     const content = message.content;
@@ -198,6 +290,10 @@ function extractMessageText(message: AgentMessageLike | any): string {
         .filter((c: any) => c?.type === "text" && typeof c?.text === "string")
         .map((c: any) => c.text);
       if (textBlocks.length > 0) return textBlocks.join(" ");
+      const onlyToolish = content.every((c: any) =>
+        c && typeof c === "object" && ["toolCall", "toolResult", "reasoning", "thinking"].includes(String(c.type ?? "")),
+      );
+      if (onlyToolish) return "";
     }
     if (typeof content === "string") return content;
   }
@@ -209,6 +305,8 @@ function shouldStageText(text: string): boolean {
   if (!trimmed || trimmed.length < 10) return false;
   if (trimmed.startsWith("/") && !trimmed.includes(":")) return false;
   if (trimmed.includes("<relevant-memories>") || trimmed.includes("[MEMORY_RECALL]")) return false;
+  if (trimmed.includes("\"toolCall\"") || trimmed.includes("\"toolResult\"")) return false;
+  if (isSyntheticBootstrapQueryText(trimmed)) return false;
   return true;
 }
 
@@ -222,16 +320,100 @@ const SKIP_RETRIEVAL_PATTERNS = [
   /^HEARTBEAT/i,
 ];
 
+const MEMORY_INTENT_PATTERN = /(remember|recall|previously|last time|yesterday|before|之前|上次|以前|還記得|記得|提到過|說過|昨天)/i;
+
 function shouldSkipRetrieval(query: string): boolean {
   const trimmed = query.trim();
   if (trimmed.length < 4) return true;
   // Force retrieve for memory-intent queries
-  if (/(remember|recall|之前|上次|以前|還記得|記得|提到過|說過|last time|previously)/i.test(trimmed)) return false;
+  if (MEMORY_INTENT_PATTERN.test(trimmed)) return false;
   if (SKIP_RETRIEVAL_PATTERNS.some(p => p.test(trimmed))) return true;
   // Skip very short non-question messages
   const hasCJK = /[\u4e00-\u9fff]/.test(trimmed);
   if (trimmed.length < (hasCJK ? 6 : 15) && !trimmed.includes('?') && !trimmed.includes('？')) return true;
   return false;
+}
+
+function isMemoryIntentQuery(query: string): boolean {
+  return MEMORY_INTENT_PATTERN.test(query.trim());
+}
+
+function isSyntheticBootstrapQueryText(text: string): boolean {
+  const trimmed = text.trim();
+  return trimmed === "(session bootstrap)" || isSyntheticStartupText(trimmed);
+}
+
+function stripConversationMetadata(text: string): string {
+  let stripped = text.replace(/\r\n/g, "\n");
+  stripped = stripped.replace(/Conversation info \(untrusted metadata\):\s*```json[\s\S]*?```\s*/gi, "");
+  stripped = stripped.replace(/Sender \(untrusted metadata\):\s*```json[\s\S]*?```\s*/gi, "");
+  stripped = stripped.replace(/^\[[^\]]*GMT[^\]]*\]\s*/gm, "");
+  return stripped.trim();
+}
+
+function isSyntheticStartupText(text: string): boolean {
+  const trimmed = text.trim();
+  return trimmed.includes("A new session was started via /new or /reset")
+    && trimmed.includes("Execute your Session Startup sequence now");
+}
+
+function sanitizeDistillMessageText(text: string): string {
+  const stripped = stripConversationMetadata(text);
+  if (!stripped) return "";
+  if (isSyntheticBootstrapQueryText(stripped)) return "";
+  if (stripped.startsWith("/") && !stripped.includes(":")) return "";
+  if (stripped.includes("<relevant-memories>") || stripped.includes("[MEMORY_RECALL]")) return "";
+  return stripped.trim();
+}
+
+function buildDistillTranscript(
+  lines: string[],
+  tokenBudget: number,
+): { transcript: string; estimatedTokens: number; keptMessages: number } {
+  const collected: string[] = [];
+  let totalTokens = 0;
+  let keptMessages = 0;
+
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    try {
+      const entry = JSON.parse(lines[i]);
+      if (entry?.type !== "message") continue;
+
+      const role = entry.message?.role;
+      const content = entry.message?.content;
+      if (role !== "user" && role !== "assistant") continue;
+
+      const rawText = typeof content === "string"
+        ? content
+        : Array.isArray(content)
+          ? content.filter((c: any) => c?.type === "text").map((c: any) => c.text).join(" ")
+          : JSON.stringify(content);
+
+      const text = sanitizeDistillMessageText(rawText);
+      if (!text || text.length <= 5) continue;
+
+      let formatted = `${role}: ${text}`;
+      let lineTokens = Math.ceil(formatted.length / 4);
+      if (totalTokens + lineTokens > tokenBudget) {
+        const remainingTokens = tokenBudget - totalTokens;
+        const overheadTokens = Math.ceil((role.length + 2) / 4);
+        const textTokenBudget = remainingTokens - overheadTokens;
+        if (textTokenBudget < 8) break;
+        const maxChars = Math.max(32, textTokenBudget * 4);
+        formatted = `${role}: ${text.slice(0, maxChars).trim()}`;
+        lineTokens = Math.ceil(formatted.length / 4);
+      }
+
+      collected.unshift(formatted);
+      totalTokens += lineTokens;
+      keptMessages += 1;
+      if (totalTokens >= tokenBudget) break;
+    } catch {
+      // Ignore parse errors
+    }
+  }
+
+  return { transcript: collected.join("\n"), estimatedTokens: totalTokens, keptMessages };
 }
 
 // Post-retrieval scoring: recency boost + importance weighting + type boosting (item 6)
@@ -290,7 +472,7 @@ async function selectRelevantMemories(
     // Apply recency + importance scoring, then trim
     return applyPostScoring(results).slice(0, limit);
   } catch (error) {
-    console.error(`[memory-lancedb-brain] selectRelevantMemories error (scope=${scope}): ${error instanceof Error ? error.stack : String(error)}`);
+    recordError(deps, `selectRelevantMemories error (scope=${scope}): ${error instanceof Error ? error.stack : String(error)}`);
     return [];
   }
 }
@@ -313,10 +495,106 @@ function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
 }
 
+function buildRecallQuery(messages: AgentMessageLike[], session: SessionState): string {
+  const userTurns = messages
+    .filter((message) => String(message?.role ?? "").toLowerCase() === "user")
+    .map((message) => extractMessageText(message))
+    .map((text) => stripConversationMetadata(text))
+    .map((text) => text.trim())
+    .filter((text) => text.length > 0 && !isSyntheticBootstrapQueryText(text));
+
+  const currentUserQuery = userTurns.at(-1)?.slice(0, 600) ?? "";
+
+  if (currentUserQuery) return currentUserQuery;
+
+  const pendingPromptQuery = stripConversationMetadata(session.pendingPrompt ?? "").trim().slice(0, 600);
+  if (pendingPromptQuery && !isSyntheticBootstrapQueryText(pendingPromptQuery)) return pendingPromptQuery;
+
+  return session.staging
+    .map((text) => stripConversationMetadata(text))
+    .filter((text) => {
+      const trimmed = text.trim();
+      if (!trimmed) return false;
+      if (trimmed.startsWith("[") && trimmed.includes("GMT+")) return false;
+      if (trimmed.startsWith("{") && trimmed.includes("\"toolCall\"")) return false;
+      if (isSyntheticBootstrapQueryText(trimmed)) return false;
+      return true;
+    })
+    .at(-1)?.slice(0, 600) ?? "";
+}
+
 function renderMemorySection(title: string, memories: MemoryRecord[]): string {
   if (memories.length === 0) return "";
   const items = memories.map(m => `- ${m.content}`).join("\n");
   return `### ${title}\n\n${items}`;
+}
+
+function buildMemoryContractBlock(params: {
+  ownerShared: MemoryRecord[];
+  agentLocal: MemoryRecord[];
+  memoryIntentQuery: boolean;
+  noHitForIntentQuery: boolean;
+}): string {
+  const sections = [
+    renderMemorySection("OWNER SHARED MEMORY", params.ownerShared),
+    renderMemorySection("AGENT LOCAL MEMORY", params.agentLocal),
+  ].filter(Boolean);
+
+  const lines = [
+    "<long-term-memory>",
+    "Long-term memory is provided by memory-lancedb-brain and persists across sessions.",
+    "Use any retrieved memories naturally. Do not narrate internal memory mechanics unless the user asks.",
+  ];
+
+  if (params.noHitForIntentQuery) {
+    lines.push("No relevant long-term memory was retrieved for this query.");
+    lines.push("If the user asks about yesterday, previous discussions, or remembered facts, say you did not find relevant long-term memory right now.");
+    lines.push("Do NOT claim that a restart, /new, or a fresh session wipes all memory or returns you to a blank initial state.");
+  } else if (params.memoryIntentQuery) {
+    lines.push("The user is explicitly asking about prior discussions or remembered facts.");
+    lines.push("Answer directly using the retrieved memories below.");
+    lines.push("Do NOT say that you do not remember, that memory was reset, or that every fresh session starts blank while relevant memories are listed below.");
+  } else {
+    lines.push("Do NOT announce that you remember things or say \"I've noted that\". Just use the knowledge naturally.");
+  }
+
+  if (sections.length > 0) {
+    lines.push("");
+    lines.push(sections.join("\n\n"));
+  }
+
+  lines.push("</long-term-memory>");
+  return lines.join("\n");
+}
+
+function buildPromptContextBlock(params: {
+  ownerShared: MemoryRecord[];
+  agentLocal: MemoryRecord[];
+  memoryIntentQuery: boolean;
+  noHitForIntentQuery: boolean;
+}): string | undefined {
+  if (!params.memoryIntentQuery) return undefined;
+
+  const memoryLines = [...params.ownerShared, ...params.agentLocal].map((memory) => `- ${memory.content}`);
+  const lines = [
+    "[Long-term memory check for this turn]",
+  ];
+
+  if (params.noHitForIntentQuery) {
+    lines.push("No relevant long-term memory was found for this query.");
+    lines.push("If asked about previous discussions or yesterday, say you did not find relevant long-term memory right now.");
+    lines.push("Do not claim that /new, restart, or a fresh session wipes all memory.");
+    return lines.join("\n");
+  }
+
+  if (memoryLines.length === 0) return undefined;
+
+  lines.push("The user is asking about prior discussions or remembered facts.");
+  lines.push("Use the recalled memories below directly if they answer the question.");
+  lines.push("Do not say you found no relevant long-term memory while these memories are listed.");
+  lines.push("");
+  lines.push(...memoryLines);
+  return lines.join("\n");
 }
 
 async function compactSession(
@@ -360,37 +638,12 @@ async function compactSession(
       return { ok: true, compacted: false, reason: "No session transcript to distill" };
     }
 
-    // Build conversation transcript from last 100 messages
-    const transcriptParts: string[] = [];
-    for (const line of lines.slice(-100)) {
-      try {
-        const entry = JSON.parse(line);
-        if (entry?.type !== "message") continue;
+    const distillTokenBudget = Math.max(40, deps.autoDistill?.tokenBudget ?? DEFAULT_AUTO_DISTILL.tokenBudget);
+    const { transcript: fullTranscript, keptMessages: keptTranscriptMessages } = buildDistillTranscript(lines.slice(-100), distillTokenBudget);
 
-        const role = entry.message?.role;
-        const content = entry.message?.content;
-
-        if (role !== "user" && role !== "assistant") continue;
-
-        const text = typeof content === "string"
-          ? content
-          : Array.isArray(content)
-            ? content.filter((c: any) => c?.type === "text").map((c: any) => c.text).join(" ")
-            : JSON.stringify(content);
-
-        if (text && text.trim().length > 10) {
-          transcriptParts.push(`${role}: ${text}`);
-        }
-      } catch {
-        // Ignore parse errors
-      }
-    }
-
-    if (transcriptParts.length < 2) {
+    if (keptTranscriptMessages < 2 || !fullTranscript.trim()) {
       return { ok: true, compacted: false, reason: "Insufficient conversation content" };
     }
-
-    const fullTranscript = transcriptParts.join("\n");
 
     // Distill using LLM
     const distillResult = await deps.distiller.distillTranscript(fullTranscript, {
@@ -505,6 +758,10 @@ async function compactSession(
       },
     };
   } catch (error) {
+    recordError(
+      deps,
+      `compactSession failed for session ${params.sessionId}: ${error instanceof Error ? error.message : String(error)}`,
+    );
     return {
       ok: false,
       compacted: false,
@@ -525,12 +782,15 @@ async function checkAndAutoDistill(
   }
 
   if (!session.sessionFile) {
-    console.log(`[memory-lancedb-brain] Auto-distill skipped (${trigger}): no sessionFile for session ${session.sessionId}`);
+    recordWarning(deps, `Auto-distill skipped (${trigger}): no sessionFile for session ${session.sessionId}`);
     return false;
   }
 
   if (session.staging.length < config.minStagingLength) {
-    console.log(`[memory-lancedb-brain] Auto-distill skipped (${trigger}): staging ${session.staging.length} < min ${config.minStagingLength}`);
+    recordWarning(
+      deps,
+      `Auto-distill skipped (${trigger}): staging ${session.staging.length} < min ${config.minStagingLength}`,
+    );
     return false;
   }
 
@@ -550,10 +810,10 @@ async function checkAndAutoDistill(
       return true;
     }
 
-    console.log(`[memory-lancedb-brain] Auto-distill no-op (${trigger}): ${result.reason ?? "no memories produced"}`);
+    recordWarning(deps, `Auto-distill no-op (${trigger}): ${result.reason ?? "no memories produced"}`);
     return false;
   } catch (error) {
-    console.error(`[memory-lancedb-brain] Auto-distill failed (${trigger}): ${error instanceof Error ? error.message : String(error)}`);
+    recordError(deps, `Auto-distill failed (${trigger}): ${error instanceof Error ? error.message : String(error)}`);
     return false;
   }
 }
@@ -570,13 +830,23 @@ export function createMemoryBrainContextEngine(deps: ContextEngineDeps) {
       console.log(`[memory-lancedb-brain] bootstrap: sessionId=${params.sessionId} sessionFile=${params.sessionFile}`);
       // Resolve owner from plugin config so session state has it for compaction
       const fallbackOwner = resolveOwnerFallback(deps);
-      upsertSessionState(deps, {
+      const session = upsertSessionState(deps, {
         sessionId: params.sessionId,
         sessionKey: params.sessionFile.replace(/\.jsonl$/, ""),
         sessionFile: params.sessionFile,
         ownerId: fallbackOwner?.ownerId,
         ownerNamespace: fallbackOwner?.ownerNamespace,
       });
+      if (deps.diagnostics) {
+        deps.diagnostics.lastBootstrap = {
+          at: Date.now(),
+          sessionId: params.sessionId,
+          sessionFile: params.sessionFile,
+          agentId: session.agentId,
+          ownerId: session.owner?.ownerId,
+          ownerNamespace: session.owner?.ownerNamespace,
+        };
+      }
       return { bootstrapped: true, importedMessages: 0 };
     },
 
@@ -603,12 +873,26 @@ export function createMemoryBrainContextEngine(deps: ContextEngineDeps) {
       console.log(`[memory-lancedb-brain] afterTurn: sessionId=${params.sessionId} sessionFile=${params.sessionFile} messages=${params.messages.length}`);
       // Ensure owner is set on session — use runtimeContext or plugin config
       const ownerForSession = resolveOwnerFallback(deps, params.runtimeContext);
+      const runtimeAgentId =
+        typeof params.runtimeContext?.agentId === "string" ? params.runtimeContext.agentId : undefined;
       const session = upsertSessionState(deps, {
         sessionId: params.sessionId,
         sessionKey: params.sessionFile.replace(/\.jsonl$/, ""),
         sessionFile: params.sessionFile,
+        agentId: runtimeAgentId,
         ownerId: ownerForSession?.ownerId,
         ownerNamespace: ownerForSession?.ownerNamespace,
+        messageChannel:
+          typeof params.runtimeContext?.messageChannel === "string" ? params.runtimeContext.messageChannel : undefined,
+        requesterSenderId:
+          typeof params.runtimeContext?.requesterSenderId === "string"
+            ? params.runtimeContext.requesterSenderId
+            : undefined,
+        agentAccountId:
+          typeof params.runtimeContext?.agentAccountId === "string" ? params.runtimeContext.agentAccountId : undefined,
+        senderIsOwner:
+          typeof params.runtimeContext?.senderIsOwner === "boolean" ? params.runtimeContext.senderIsOwner : undefined,
+        channelId: typeof params.runtimeContext?.channelId === "string" ? params.runtimeContext.channelId : undefined,
       });
       for (const message of params.messages.slice(params.prePromptMessageCount)) {
         const text = extractMessageText(message);
@@ -617,24 +901,78 @@ export function createMemoryBrainContextEngine(deps: ContextEngineDeps) {
       if (params.autoCompactionSummary && shouldStageText(params.autoCompactionSummary)) {
         session.staging.push(params.autoCompactionSummary);
       }
+      session.pendingPrompt = undefined;
+      session.pendingPromptContext = undefined;
       session.staging = session.staging.slice(-30);
       deps.sessionStates.set(session.sessionId, session);
+      if (deps.diagnostics) {
+        deps.diagnostics.lastAfterTurn = {
+          at: Date.now(),
+          sessionId: params.sessionId,
+          sessionFile: params.sessionFile,
+          agentId: session.agentId,
+          ownerId: session.owner?.ownerId,
+          stagedCount: session.staging.length,
+        };
+      }
     },
 
     async assemble(params: { sessionId: string; messages: AgentMessageLike[]; tokenBudget?: number }): Promise<AssembleResult> {
       const session = upsertSessionState(deps, { sessionId: params.sessionId });
-      const recentStaging = session.staging.slice(-5).join(" ").slice(0, 300);
+      const recallQuery = buildRecallQuery(params.messages, session);
 
       // Adaptive: skip retrieval for greetings, commands, short affirmations
-      if (!recentStaging || shouldSkipRetrieval(recentStaging)) {
+      if (!recallQuery || shouldSkipRetrieval(recallQuery)) {
+        session.pendingPromptContext = undefined;
+        deps.sessionStates.set(session.sessionId, session);
+        if (deps.diagnostics) {
+          deps.diagnostics.lastAssemble = {
+            at: Date.now(),
+            sessionId: params.sessionId,
+            agentId: session.agentId,
+            ownerId: session.owner?.ownerId,
+            query: recallQuery,
+            ownerSharedCount: 0,
+            agentLocalCount: 0,
+            skipped: true,
+            reason: recallQuery ? "query_skipped" : "empty_query",
+          };
+        }
         return { messages: params.messages, estimatedTokens: 0 };
       }
 
-      const ownerShared = trimMemoriesByTokenBudget(await selectRelevantMemories(deps, session, "owner_shared", 15, recentStaging), 2000);
-      const agentLocal = trimMemoriesByTokenBudget(await selectRelevantMemories(deps, session, "agent_local", 5, recentStaging), 800);
-      console.log(`[memory-lancedb-brain] assemble: sessionId=${params.sessionId} query=${recentStaging.slice(0, 60)}... ownerShared=${ownerShared.length} agentLocal=${agentLocal.length}`);
+      const ownerShared = trimMemoriesByTokenBudget(
+        await selectRelevantMemories(deps, session, "owner_shared", 15, recallQuery),
+        2000,
+      );
+      const agentLocal = trimMemoriesByTokenBudget(
+        await selectRelevantMemories(deps, session, "agent_local", 5, recallQuery),
+        800,
+      );
+      console.log(`[memory-lancedb-brain] assemble: sessionId=${params.sessionId} query=${recallQuery.slice(0, 60)}... ownerShared=${ownerShared.length} agentLocal=${agentLocal.length}`);
+      if (deps.diagnostics) {
+        deps.diagnostics.lastAssemble = {
+          at: Date.now(),
+          sessionId: params.sessionId,
+          agentId: session.agentId,
+          ownerId: session.owner?.ownerId,
+          query: recallQuery,
+          ownerSharedCount: ownerShared.length,
+          agentLocalCount: agentLocal.length,
+          skipped: false,
+        };
+      }
 
-      if (ownerShared.length === 0 && agentLocal.length === 0) {
+      const noHitForIntentQuery = ownerShared.length === 0 && agentLocal.length === 0 && isMemoryIntentQuery(recallQuery);
+      const memoryIntentQuery = isMemoryIntentQuery(recallQuery);
+      session.pendingPromptContext = buildPromptContextBlock({
+        ownerShared,
+        agentLocal,
+        memoryIntentQuery,
+        noHitForIntentQuery,
+      });
+      deps.sessionStates.set(session.sessionId, session);
+      if (ownerShared.length === 0 && agentLocal.length === 0 && !noHitForIntentQuery) {
         return { messages: params.messages, estimatedTokens: 0 };
       }
 
@@ -644,19 +982,12 @@ export function createMemoryBrainContextEngine(deps: ContextEngineDeps) {
         deps.storage.updateMemory(m.memory_id, { last_used_at: Date.now() }).catch(() => {}),
       ));
 
-      const sections = [
-        renderMemorySection("OWNER SHARED MEMORY", ownerShared),
-        renderMemorySection("AGENT LOCAL MEMORY", agentLocal),
-      ].filter(Boolean);
-
-      const memoryBlock = [
-        "<long-term-memory>",
-        "Facts about this user from previous conversations. Use them proactively to provide personalized context.",
-        "Do NOT announce that you remember things or say \"I've noted that\". Just use the knowledge naturally.",
-        "",
-        sections.join("\n\n"),
-        "</long-term-memory>",
-      ].join("\n");
+      const memoryBlock = buildMemoryContractBlock({
+        ownerShared,
+        agentLocal,
+        memoryIntentQuery,
+        noHitForIntentQuery,
+      });
 
       return {
         messages: params.messages,
@@ -680,16 +1011,32 @@ export function createMemoryBrainContextEngine(deps: ContextEngineDeps) {
         const resolved = resolveOwnerFallback(deps, params.runtimeContext);
         if (resolved) {
           session.owner = resolved;
+          if (typeof params.runtimeContext?.agentId === "string") session.agentId = params.runtimeContext.agentId;
+          if (typeof params.runtimeContext?.messageChannel === "string") session.messageChannel = params.runtimeContext.messageChannel;
+          if (typeof params.runtimeContext?.requesterSenderId === "string") session.requesterSenderId = params.runtimeContext.requesterSenderId;
+          if (typeof params.runtimeContext?.agentAccountId === "string") session.agentAccountId = params.runtimeContext.agentAccountId;
+          if (typeof params.runtimeContext?.senderIsOwner === "boolean") session.senderIsOwner = params.runtimeContext.senderIsOwner;
           deps.sessionStates.set(params.sessionId, session);
         }
       }
-      return compactSession(deps, {
+      const result = await compactSession(deps, {
         sessionId: params.sessionId,
         sessionFile: params.sessionFile,
         currentTokenCount: params.currentTokenCount,
         force: params.force,
         customInstructions: params.customInstructions,
       });
+      if (deps.diagnostics) {
+        deps.diagnostics.lastCompact = {
+          at: Date.now(),
+          sessionId: params.sessionId,
+          ok: result.ok,
+          compacted: result.compacted,
+          insertedCount: Number(result.result?.insertedCount ?? 0) || undefined,
+          reason: result.reason,
+        };
+      }
+      return result;
     },
 
     async prepareSubagentSpawn(params: { parentSessionKey: string; childSessionKey: string; ttlMs?: number }) {
@@ -708,6 +1055,10 @@ export function createMemoryBrainContextEngine(deps: ContextEngineDeps) {
         agentId: parent.agentId,
         ownerId: parent.owner?.ownerId,
         ownerNamespace: parent.owner?.ownerNamespace,
+        messageChannel: parent.messageChannel,
+        requesterSenderId: parent.requesterSenderId,
+        agentAccountId: parent.agentAccountId,
+        senderIsOwner: parent.senderIsOwner,
         channelId: parent.channelId,
         parentSessionKey: params.parentSessionKey,
       });
@@ -755,13 +1106,13 @@ export function createMemoryDistillCommand(
 ) {
   return {
     name: "memory",
-    description: "Manual memory operations for memory-lancedb-brain: distill, recall, list, store.",
+    description: "Manual memory operations for memory-lancedb-brain: distill, recall, list, store, import-legacy.",
     acceptsArgs: true,
     handler: async (ctx: { args?: string; channel: string }) => {
       const args = (ctx.args ?? "").trim();
       if (!args) {
         return {
-          text: `Usage:\n  /memory distill — Force distill current session to LanceDB\n  /memory recall [query] — Search memories by query\n  /memory list [scope] — List memories by scope (owner_shared/agent_local/all)\n  /memory store [text] — Store a single memory immediately\n  /memory consolidate — Merge related memory fragments via LLM\n  /memory profile — Synthesize structured user profile from memories\n  /memory decay — Apply confidence decay to unused memories`,
+          text: `Usage:\n  /memory distill — Force distill current session to LanceDB\n  /memory recall [query] — Search memories by query\n  /memory list [scope] — List memories by scope (owner_shared/agent_local/all)\n  /memory store [text] — Store a single memory immediately\n  /memory import-legacy [path] — Import legacy markdown notes into LanceDB\n  /memory migrate-legacy [path] — Alias of import-legacy\n  /memory consolidate — Merge related memory fragments via LLM\n  /memory profile — Synthesize structured user profile from memories\n  /memory decay — Apply confidence decay to unused memories`,
         };
       }
 
@@ -967,6 +1318,48 @@ export function createMemoryDistillCommand(
           }
         }
 
+        case "import-legacy":
+        case "migrate-legacy": {
+          const sessionId = deps.lastSessionByChannel.get(ctx.channel) ?? [...deps.sessionStates.keys()].at(-1);
+          if (!sessionId) {
+            return { text: "No active session available." };
+          }
+
+          const session = deps.sessionStates.get(sessionId);
+          if (!session) {
+            return { text: "Session not found." };
+          }
+
+          if (!session.owner?.ownerId || !session.owner?.ownerNamespace) {
+            return { text: "Missing owner context — cannot import legacy memory without owner_id and owner_namespace.", isError: true };
+          }
+
+          const targetPath = subArgs.trim() || `${process.env.HOME ?? ""}/.openclaw/workspace/memory`;
+          try {
+            const importResult = await importLegacyMarkdown(
+              {
+                storage: deps.storage,
+                embedder: deps.embedder,
+              },
+              {
+                rootPath: targetPath,
+                ownerId: session.owner.ownerId,
+                ownerNamespace: session.owner.ownerNamespace,
+                agentId: session.agentId ?? "unknown",
+                sourceSessionId: sessionId,
+              },
+            );
+            const errorSuffix = importResult.errors.length > 0
+              ? `\nErrors (${importResult.errors.length}):\n- ${importResult.errors.slice(0, 5).join("\n- ")}`
+              : "";
+            return {
+              text: `Legacy import complete.\nDiscovered: ${importResult.filesDiscovered}\nConsidered: ${importResult.filesConsidered}\nImported: ${importResult.imported}\nUpdated: ${importResult.updated}\nSkipped: ${importResult.skipped}${errorSuffix}`,
+            };
+          } catch (error) {
+            return { text: `Legacy import failed: ${error instanceof Error ? error.message : String(error)}`, isError: true };
+          }
+        }
+
         case "consolidate": {
           // Item 1: Memory Consolidation
           if (!deps.llmCaller) {
@@ -1042,7 +1435,7 @@ export function createMemoryDistillCommand(
 
         default:
           return {
-            text: `Unknown command: ${command}.\n\nUsage:\n  /memory distill\n  /memory recall [query]\n  /memory list [scope]\n  /memory store [text]\n  /memory consolidate\n  /memory profile\n  /memory decay`,
+            text: `Unknown command: ${command}.\n\nUsage:\n  /memory distill\n  /memory recall [query]\n  /memory list [scope]\n  /memory store [text]\n  /memory import-legacy [path]\n  /memory migrate-legacy [path]\n  /memory consolidate\n  /memory profile\n  /memory decay`,
           };
       }
     },

@@ -21,6 +21,7 @@ import {
   validateAccess,
   type OwnerConfig,
 } from "./owners.js";
+import type { BrainDiagnostics } from "./context-engine.js";
 
 export interface ToolCoreContext {
   storage: MemoryStorage;
@@ -39,6 +40,10 @@ export interface ToolCoreContext {
     rerankEndpoint?: string;
     candidatePoolSize?: number;
   };
+  diagnostics?: BrainDiagnostics;
+  dbPath?: string;
+  pluginId?: string;
+  pluginVersion?: string;
 }
 
 interface ToolRuntimeContext {
@@ -120,6 +125,19 @@ async function resolveExecutionContext(core: ToolCoreContext, runtime: ToolRunti
     sessionId: runtime.sessionId ?? runtime.sessionKey ?? "unknown-session",
     accessibleScopes: getAccessibleScopes(runtime.agentId, core.agentWhitelist),
   };
+}
+
+async function resolveExecutionContextBestEffort(core: ToolCoreContext, runtime: ToolRuntimeContext) {
+  try {
+    return await resolveExecutionContext(core, runtime);
+  } catch {
+    return {
+      owner: undefined,
+      agentId: runtime.agentId,
+      sessionId: runtime.sessionId ?? runtime.sessionKey ?? "unknown-session",
+      accessibleScopes: getAccessibleScopes(runtime.agentId, core.agentWhitelist),
+    };
+  }
 }
 
 async function recordEvent(
@@ -466,6 +484,78 @@ function createMemoryStatsTool(core: ToolCoreContext, runtime: ToolRuntimeContex
   };
 }
 
+function createMemoryStatusTool(core: ToolCoreContext, runtime: ToolRuntimeContext) {
+  return {
+    name: "memory_status",
+    label: "Memory Status",
+    description: "Report whether memory-lancedb-brain is loaded and which runtime evidence supports that conclusion.",
+    parameters: {
+      type: "object",
+      properties: {},
+    },
+    async execute() {
+      const ctx = await resolveExecutionContextBestEffort(core, runtime);
+      const countsByAccessibleScope: Record<string, number> = {};
+      if (ctx.owner) {
+        const scopes: MemoryScope[] =
+          ctx.accessibleScopes.length > 0 ? ctx.accessibleScopes : ["agent_local", "session_distilled"];
+        for (const scope of scopes) {
+          const rows = await core.storage.queryMemoriesByFilter(buildBaseFilters(ctx.owner, ctx.agentId, scope));
+          countsByAccessibleScope[scope] = rows.length;
+        }
+      }
+
+      const diagnostics = core.diagnostics;
+      const lines = [
+        `${core.pluginId ?? "memory-lancedb-brain"} is loaded as an in-process OpenClaw plugin.`,
+        `dbPath: ${core.dbPath ?? diagnostics?.dbPath ?? "unknown"}`,
+        `agentId: ${ctx.agentId ?? "unknown"}`,
+        `owner: ${ctx.owner ? `${ctx.owner.ownerId}/${ctx.owner.ownerNamespace}` : "unresolved"}`,
+        `accessibleScopes: ${ctx.accessibleScopes.length > 0 ? ctx.accessibleScopes.join(", ") : "none"}`,
+      ];
+      if (Object.keys(countsByAccessibleScope).length > 0) {
+        lines.push(
+          `counts: ${Object.entries(countsByAccessibleScope).map(([scope, count]) => `${scope}=${count}`).join(", ")}`,
+        );
+      }
+      if (diagnostics?.lastAssemble) {
+        lines.push(
+          `lastAssemble: query="${diagnostics.lastAssemble.query.slice(0, 80)}" ownerShared=${diagnostics.lastAssemble.ownerSharedCount} agentLocal=${diagnostics.lastAssemble.agentLocalCount}`,
+        );
+      }
+      if (diagnostics?.lastAfterTurn) {
+        lines.push(`lastAfterTurn: stagedCount=${diagnostics.lastAfterTurn.stagedCount}`);
+      }
+      if (diagnostics?.lastCompact) {
+        lines.push(
+          `lastCompact: ok=${diagnostics.lastCompact.ok} compacted=${diagnostics.lastCompact.compacted} inserted=${diagnostics.lastCompact.insertedCount ?? 0}`,
+        );
+      }
+      lines.push("note: no standalone lancedb process/container is expected because brain runs inside openclaw-gateway.");
+
+      return content(lines.join("\n"), {
+        pluginId: core.pluginId ?? diagnostics?.pluginId ?? "memory-lancedb-brain",
+        pluginVersion: core.pluginVersion ?? "unknown",
+        loaded: true,
+        inProcessPlugin: true,
+        dbPath: core.dbPath ?? diagnostics?.dbPath,
+        trustedPluginExplicit: diagnostics?.trustedPluginExplicit,
+        owner: ctx.owner,
+        agentId: ctx.agentId,
+        sessionId: ctx.sessionId,
+        accessibleScopes: ctx.accessibleScopes,
+        countsByAccessibleScope,
+        lastBootstrap: diagnostics?.lastBootstrap,
+        lastAssemble: diagnostics?.lastAssemble,
+        lastAfterTurn: diagnostics?.lastAfterTurn,
+        lastCompact: diagnostics?.lastCompact,
+        recentWarnings: diagnostics?.recentWarnings ?? [],
+        recentErrors: diagnostics?.recentErrors ?? [],
+      });
+    },
+  };
+}
+
 export function registerAllMemoryTools(api: OpenClawPluginApi & { registerTool?: Function }, core: ToolCoreContext): void {
   const tools = [
     { name: "memory_recall", factory: createMemoryRecallTool },
@@ -474,6 +564,7 @@ export function registerAllMemoryTools(api: OpenClawPluginApi & { registerTool?:
     { name: "memory_update", factory: createMemoryUpdateTool },
     { name: "memory_list", factory: createMemoryListTool },
     { name: "memory_stats", factory: createMemoryStatsTool },
+    { name: "memory_status", factory: createMemoryStatusTool },
   ];
 
   for (const tool of tools) {

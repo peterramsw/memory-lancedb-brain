@@ -76,6 +76,16 @@ function normalizeScopeRecommendation(scope: DistillOutput["scope_recommendation
   return "agent_local";
 }
 
+function isSyntheticPersistedMemoryText(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return true;
+  if (trimmed === "(session bootstrap)") return true;
+  if (trimmed.includes("A new session was started via /new or /reset")
+    && trimmed.includes("Execute your Session Startup sequence now")) return true;
+  if (trimmed.includes("Conversation info (untrusted metadata):")) return true;
+  return false;
+}
+
 export async function buildCandidateMemories(
   deps: LifecycleDeps,
   session: LifecycleSessionInfo,
@@ -119,6 +129,7 @@ export async function buildCandidateMemories(
   for (const item of items) {
     const text = item.text.trim();
     if (!text) continue;
+    if (isSyntheticPersistedMemoryText(text)) continue;
     const embedding = await deps.embedder.embed(text);
     candidates.push({
       memory_id: randomUUID(),
