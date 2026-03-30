@@ -733,11 +733,18 @@ async function compactSession(
           const chunkText = chunkLines.map(line => {
             try {
               const parsed = JSON.parse(line);
-              return `${parsed.message?.role || "unknown"}: ${parsed.message?.content || ""}`;
+              if (parsed.type !== "message") return "";
+              const content = parsed.message?.content;
+              const normalized = typeof content === "string"
+                ? content
+                : Array.isArray(content)
+                  ? content.filter((c: any) => c?.type === "text").map((c: any) => c.text).join(" ")
+                  : JSON.stringify(content);
+              return `${parsed.message?.role || "unknown"}: ${normalized}`;
             } catch {
               return line;
             }
-          }).join("\n");
+          }).filter(Boolean).join("\n");
           
           if (!chunkText.trim()) continue;
           
@@ -1011,19 +1018,17 @@ export function createMemoryBrainContextEngine(deps: ContextEngineDeps) {
       let sessionEpisodes: MemoryRecord[] = [];
       if (session.owner?.ownerId && session.owner?.ownerNamespace) {
         try {
-          // Since episodes are raw transcript chunks for the current session,
-          // simply grabbing the most recent ones via filter is often good enough,
-          // but we can just fetch them all for this session and pick the most recent
-          // or use the existing hybrid search. Wait, selectRelevantMemories already does hybrid search!
-          // We can just use it with a custom scope or type, but selectRelevantMemories is hardcoded to specific scopes.
-          // Let's just fetch them directly using queryMemoriesByFilter and take the last 5 chunks.
+          // Address P1 (Scope by namespace) and P2 (Push session filter to storage)
           const rawEpisodes = await deps.storage.queryMemoriesByFilter({
             owner_id: session.owner.ownerId,
-            memory_type: "episode"
+            owner_namespace: session.owner.ownerNamespace,
+            memory_type: "episode",
+            source_session_id: params.sessionId
           });
-          // Filter by source_session_id manually since MemoryFilters doesn't have it
+          
+          // Sort in application code as queryMemoriesByFilter doesn't support sorting yet,
+          // but at least we've narrowed down the result set at the database layer.
           const sessionSpecificEpisodes = rawEpisodes
-            .filter(e => e.source_session_id === params.sessionId)
             .sort((a, b) => (b.created_at || 0) - (a.created_at || 0))
             .slice(0, 3); // take the 3 most recent chunks
           sessionEpisodes = trimMemoriesByTokenBudget(sessionSpecificEpisodes, 1500); // Allow up to ~1500 tokens of raw history
