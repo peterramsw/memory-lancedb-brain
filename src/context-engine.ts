@@ -746,21 +746,27 @@ async function compactSession(
           
           const vector = await deps.embedder.embed(fullContent);
           
-          const record = {
-            id: `episode-${Date.now()}-${i}`,
+          const record: MemoryRecord = {
+            memory_id: `episode-${Date.now()}-${i}`,
             owner_id: ownerId,
             owner_namespace: ownerNamespace,
-            memory_scope: "session_distilled" as const,
-            memory_type: "episode" as const,
+            agent_id: agentId,
+            memory_scope: "session_distilled",
+            memory_type: "episode",
+            title: `Session Transcript Chunk ${Math.floor(i/chunkSize) + 1}`,
             content: fullContent,
+            summary: "",
+            tags: "[]",
             importance: 1, // Episode chunks have low intrinsic importance
             confidence: 1.0,
-            status: "active" as const,
-            source: "distill" as const,
+            status: "active",
+            supersedes_id: "",
+            source: "distill",
             source_session_id: params.sessionId,
             created_at: Date.now(),
             updated_at: Date.now(),
-            vector,
+            last_used_at: Date.now(),
+            embedding: vector,
           };
           
           await deps.storage.insertMemory(record);
