@@ -401,6 +401,7 @@ test("Phase 3 regression: compact splits oversized dropped messages into multipl
     })).sort((a, b) => (a.created_at || 0) - (b.created_at || 0));
 
     assert.ok(episodes.length > 1, "oversized dropped message should be split into multiple episode rows");
+    assert.strictEqual(new Set(episodes.map((memory) => memory.memory_id)).size, episodes.length, "episode IDs should be unique");
 
     const joinedEpisodeContent = episodes.map((memory) => memory.content).join("\n");
     assert.match(joinedEpisodeContent, new RegExp(headMarker));
@@ -415,7 +416,7 @@ test("Phase 3 regression: assemble recalls stored episode chunks after compactio
   const { dbPath, storage } = await setupStorage();
   const sessionFile = `/tmp/memory-lancedb-brain-session-${randomUUID()}.jsonl`;
   const recallMarker = "EPISODE-RECALL-5518";
-  const oversized = `${"continuity ".repeat(1800)} ${recallMarker} recall-tail`;
+  const oversized = `${recallMarker} ${"continuity ".repeat(1800)} recall-tail`;
 
   try {
     await writeFile(

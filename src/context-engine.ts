@@ -3,6 +3,7 @@
  * Phase 5: Auto-distill with session lifecycle hooks
  */
 
+import { randomUUID } from "node:crypto";
 import { readFile, writeFile, readdir } from "node:fs/promises";
 import { dirname, basename, join } from "node:path";
 import type { MemoryRecord, MemoryEventRecord, MemoryScope, MemoryType } from "./schema.js";
@@ -154,10 +155,9 @@ const DEFAULT_AUTO_DISTILL: AutoDistillConfig = {
   onNew: true,
 };
 
-const EPISODE_MAX_CHUNKS = 3;
 const EPISODE_CHUNK_TOKEN_BUDGET = 1200;
 const EPISODE_LINE_TOKEN_BUDGET = EPISODE_CHUNK_TOKEN_BUDGET - 32;
-const EPISODE_RECALL_TOKEN_BUDGET = EPISODE_CHUNK_TOKEN_BUDGET * EPISODE_MAX_CHUNKS + 160;
+const EPISODE_RECALL_TOKEN_BUDGET = EPISODE_CHUNK_TOKEN_BUDGET * 3 + 160;
 
 /**
  * Resolve owner from runtimeContext fields or fall back to deps.owners config.
@@ -791,7 +791,7 @@ async function compactSession(
         const contentToEmbed = `[Session Transcript Chunk ${chunkIdx + 1}]\n${currentChunkText}`;
         const vector = await deps.embedder.embed(contentToEmbed);
         episodicChunks.push({
-          memory_id: `episode-${now}-${chunkIdx}`,
+          memory_id: `episode-${params.sessionId}-${randomUUID()}`,
           owner_id: ownerId,
           owner_namespace: ownerNamespace,
           agent_id: agentId,
@@ -1095,9 +1095,7 @@ export function createMemoryBrainContextEngine(deps: ContextEngineDeps) {
           // 1. Sort by recency to pick the latest chunks
           // 2. Then sort back to oldest-to-newest for rendering
           const sessionSpecificEpisodes = rawEpisodes
-            .sort((a, b) => (b.created_at || 0) - (a.created_at || 0))
-            .slice(0, EPISODE_MAX_CHUNKS) // take the most recent bounded set
-            .sort((a, b) => (a.created_at || 0) - (b.created_at || 0)); // restore natural timeline
+            .sort((a, b) => (a.created_at || 0) - (b.created_at || 0));
           
           sessionEpisodes = trimMemoriesByTokenBudget(sessionSpecificEpisodes, EPISODE_RECALL_TOKEN_BUDGET);
         } catch (err) {
