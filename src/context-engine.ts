@@ -1018,11 +1018,13 @@ export function createMemoryBrainContextEngine(deps: ContextEngineDeps) {
       let sessionEpisodes: MemoryRecord[] = [];
       if (session.owner?.ownerId && session.owner?.ownerNamespace) {
         try {
-          // Address P1 (Scope by namespace, agent, and status) and P2 (Push session filter to storage)
+          // Address P1 (Scope by namespace and status) and P2 (Push session filter to storage).
+          // NOTE: We deliberately do NOT filter by agent_id here because memory-lancedb-brain 
+          // is designed for cross-agent recall — if multiple agents share a session, 
+          // they should all have access to the truncated transcript chunks for continuity.
           const rawEpisodes = await deps.storage.queryMemoriesByFilter({
             owner_id: session.owner.ownerId,
             owner_namespace: session.owner.ownerNamespace,
-            agent_id: session.agentId,
             memory_type: "episode",
             memory_scope: "session_distilled",
             status: "active",
