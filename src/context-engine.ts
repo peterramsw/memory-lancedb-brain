@@ -720,6 +720,56 @@ async function compactSession(
 
     const droppedCount = messageLines.length - keptMessages.length;
     if (droppedCount > 0) {
+      // Chunk and save dropped messages as episodic memory
+      const droppedMessages = messageLines.slice(0, droppedCount);
+      const chunkSize = 10; // group 10 lines at a time
+      
+      let episodicChunksInserted = 0;
+      for (let i = 0; i < droppedMessages.length; i += chunkSize) {
+        const chunkLines = droppedMessages.slice(i, i + chunkSize);
+        
+        try {
+          // Extract text content from JSONL message entries for cleaner embedding
+          const chunkText = chunkLines.map(line => {
+            try {
+              const parsed = JSON.parse(line);
+              return `${parsed.message?.role || "unknown"}: ${parsed.message?.content || ""}`;
+            } catch {
+              return line;
+            }
+          }).join("\n");
+          
+          if (!chunkText.trim()) continue;
+          
+          const headerPrefix = `[Session Transcript Chunk ${Math.floor(i/chunkSize) + 1}/${Math.ceil(droppedMessages.length/chunkSize)}]\n`;
+          const fullContent = headerPrefix + chunkText;
+          
+          const vector = await deps.embedder.embed(fullContent);
+          
+          const record = {
+            id: `episode-${Date.now()}-${i}`,
+            owner_id: ownerId,
+            owner_namespace: ownerNamespace,
+            memory_scope: "session_distilled" as const,
+            memory_type: "episode" as const,
+            content: fullContent,
+            importance: 1, // Episode chunks have low intrinsic importance
+            confidence: 1.0,
+            status: "active" as const,
+            source: "distill" as const,
+            source_session_id: params.sessionId,
+            created_at: Date.now(),
+            updated_at: Date.now(),
+            vector,
+          };
+          
+          await deps.storage.insertMemory(record);
+          episodicChunksInserted++;
+        } catch (err) {
+          console.warn(`[memory-lancedb-brain] Failed to insert episode chunk: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+
       // Insert a compaction marker
       const compactionEntry = JSON.stringify({
         type: "compaction",
@@ -729,6 +779,7 @@ async function compactSession(
         summary: distillResult.session_summary || "Session compacted by memory-lancedb-brain",
         droppedMessages: droppedCount,
         keptMessages: keptMessages.length,
+        episodesSaved: episodicChunksInserted,
       });
 
       const truncatedContent = [
@@ -738,7 +789,7 @@ async function compactSession(
       ].join("\n") + "\n";
 
       await writeFile(resolvedFile, truncatedContent, "utf-8");
-      console.log(`[memory-lancedb-brain] compactSession: truncated session file — dropped ${droppedCount} messages, kept ${keptMessages.length}, ~${keptTokens} tokens`);
+      console.log(`[memory-lancedb-brain] compactSession: truncated session file — dropped ${droppedCount} messages (saved as ${episodicChunksInserted} episodes), kept ${keptMessages.length}, ~${keptTokens} tokens`);
     }
 
     return {
@@ -949,7 +1000,33 @@ export function createMemoryBrainContextEngine(deps: ContextEngineDeps) {
         await selectRelevantMemories(deps, session, "agent_local", 5, recallQuery),
         800,
       );
-      console.log(`[memory-lancedb-brain] assemble: sessionId=${params.sessionId} query=${recallQuery.slice(0, 60)}... ownerShared=${ownerShared.length} agentLocal=${agentLocal.length}`);
+      
+      // Implicit Semantic Paging: retrieve recent episodic chunks for this session
+      let sessionEpisodes: MemoryRecord[] = [];
+      if (session.owner?.ownerId && session.owner?.ownerNamespace) {
+        try {
+          // Since episodes are raw transcript chunks for the current session,
+          // simply grabbing the most recent ones via filter is often good enough,
+          // but we can just fetch them all for this session and pick the most recent
+          // or use the existing hybrid search. Wait, selectRelevantMemories already does hybrid search!
+          // We can just use it with a custom scope or type, but selectRelevantMemories is hardcoded to specific scopes.
+          // Let's just fetch them directly using queryMemoriesByFilter and take the last 5 chunks.
+          const rawEpisodes = await deps.storage.queryMemoriesByFilter({
+            owner_id: session.owner.ownerId,
+            memory_type: "episode"
+          });
+          // Filter by source_session_id manually since MemoryFilters doesn't have it
+          const sessionSpecificEpisodes = rawEpisodes
+            .filter(e => e.source_session_id === params.sessionId)
+            .sort((a, b) => (b.created_at || 0) - (a.created_at || 0))
+            .slice(0, 3); // take the 3 most recent chunks
+          sessionEpisodes = trimMemoriesByTokenBudget(sessionSpecificEpisodes, 1500); // Allow up to ~1500 tokens of raw history
+        } catch (err) {
+          console.warn(`[memory-lancedb-brain] Failed to retrieve episode chunks: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+
+      console.log(`[memory-lancedb-brain] assemble: sessionId=${params.sessionId} query=${recallQuery.slice(0, 60)}... ownerShared=${ownerShared.length} agentLocal=${agentLocal.length} episodes=${sessionEpisodes.length}`);
       if (deps.diagnostics) {
         deps.diagnostics.lastAssemble = {
           at: Date.now(),
@@ -963,7 +1040,7 @@ export function createMemoryBrainContextEngine(deps: ContextEngineDeps) {
         };
       }
 
-      const noHitForIntentQuery = ownerShared.length === 0 && agentLocal.length === 0 && isMemoryIntentQuery(recallQuery);
+      const noHitForIntentQuery = ownerShared.length === 0 && agentLocal.length === 0 && sessionEpisodes.length === 0 && isMemoryIntentQuery(recallQuery);
       const memoryIntentQuery = isMemoryIntentQuery(recallQuery);
       session.pendingPromptContext = buildPromptContextBlock({
         ownerShared,
@@ -972,22 +1049,28 @@ export function createMemoryBrainContextEngine(deps: ContextEngineDeps) {
         noHitForIntentQuery,
       });
       deps.sessionStates.set(session.sessionId, session);
-      if (ownerShared.length === 0 && agentLocal.length === 0 && !noHitForIntentQuery) {
+      if (ownerShared.length === 0 && agentLocal.length === 0 && sessionEpisodes.length === 0 && !noHitForIntentQuery) {
         return { messages: params.messages, estimatedTokens: 0 };
       }
 
       // Item 3: Track last_used_at for retrieved memories (fire-and-forget)
-      const allRetrieved = [...ownerShared, ...agentLocal];
+      const allRetrieved = [...ownerShared, ...agentLocal]; // Skip tracking for episodes as they are session-bound anyway
       void Promise.all(allRetrieved.map((m) =>
         deps.storage.updateMemory(m.memory_id, { last_used_at: Date.now() }).catch(() => {}),
       ));
 
-      const memoryBlock = buildMemoryContractBlock({
+      let memoryBlock = buildMemoryContractBlock({
         ownerShared,
         agentLocal,
         memoryIntentQuery,
         noHitForIntentQuery,
       });
+
+      if (sessionEpisodes.length > 0) {
+        const episodeText = sessionEpisodes.map(e => e.content).join("\n\n");
+        const episodeBlock = `\n<Relevant_Past_Context>\n<!-- Restored exact transcript fragments from earlier in this session -->\n${episodeText}\n</Relevant_Past_Context>`;
+        memoryBlock += episodeBlock;
+      }
 
       return {
         messages: params.messages,
