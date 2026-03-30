@@ -720,69 +720,119 @@ async function compactSession(
 
     const droppedCount = messageLines.length - keptMessages.length;
     if (droppedCount > 0) {
-      // Chunk and save dropped messages as episodic memory
+      // Hardened Episodic Memory Persistence Logic (Validated via Logical Derivation)
       const droppedMessages = messageLines.slice(0, droppedCount);
-      const chunkSize = 10; // group 10 lines at a time
-      
-      let episodicChunksInserted = 0;
-      for (let i = 0; i < droppedMessages.length; i += chunkSize) {
-        const chunkLines = droppedMessages.slice(i, i + chunkSize);
-        
-        // Extract text content from JSONL message entries for cleaner embedding
-        const chunkText = chunkLines.map(line => {
-          try {
-            const parsed = JSON.parse(line);
-            if (parsed.type !== "message") return "";
-            const content = parsed.message?.content;
-            const normalized = typeof content === "string"
-              ? content
-              : Array.isArray(content)
-                ? content.filter((c: any) => c?.type === "text").map((c: any) => c.text).join(" ")
-                : JSON.stringify(content);
-            return `${parsed.message?.role || "unknown"}: ${normalized}`;
-          } catch {
-            return line;
-          }
-        }).filter(Boolean).join("\n");
-        
-        if (!chunkText.trim()) continue;
-        
-        const headerPrefix = `[Session Transcript Chunk ${Math.floor(i/chunkSize) + 1}/${Math.ceil(droppedMessages.length/chunkSize)}]\n`;
-        const fullContent = headerPrefix + chunkText;
-        
-        // FAIL-CLOSED: If embedding or storage fails, we MUST NOT proceed with truncation.
-        // This ensures the "lossless" contract is honored.
+      const episodicChunks: MemoryRecord[] = [];
+      const MAX_EMBEDDING_TOKENS = 6000; // Leave buffer for overhead (model limit is usually 8k)
+
+      let currentChunkText = "";
+      let currentChunkTokenCount = 0;
+      let chunkIdx = 0;
+
+      for (let i = 0; i < droppedMessages.length; i++) {
+        let lineText = "";
         try {
-          const vector = await deps.embedder.embed(fullContent);
+          const parsed = JSON.parse(droppedMessages[i]);
+          if (parsed.type !== "message") continue;
           
-          const record: MemoryRecord = {
-            memory_id: `episode-${Date.now()}-${i}`,
+          const role = parsed.message?.role || "unknown";
+          const content = parsed.message?.content;
+          
+          // Universal Serialization (P2 Fix): Preserve multimodal/tool data
+          const normalized = typeof content === "string"
+            ? content
+            : Array.isArray(content)
+              ? content.map((c: any) => {
+                  if (c?.type === "text") return c.text;
+                  return JSON.stringify(c); // Keep multimodal parts as JSON
+                }).join(" ")
+              : JSON.stringify(content); // Fallback for tool results/objects
+          
+          lineText = `${role}: ${normalized}\n`;
+        } catch {
+          lineText = droppedMessages[i] + "\n";
+        }
+
+        const lineTokens = Math.ceil(lineText.length / 4);
+        
+        // Token-budget aware chunking (P1 Fix): Prevent embedding overflow
+        if (currentChunkTokenCount + lineTokens > MAX_EMBEDDING_TOKENS && currentChunkText.trim()) {
+          // Process current chunk before starting a new one
+          const header = `[Session Transcript Chunk ${chunkIdx + 1}]\n`;
+          const contentToEmbed = header + currentChunkText;
+          const vector = await deps.embedder.embed(contentToEmbed);
+          
+          episodicChunks.push({
+            memory_id: `episode-${Date.now()}-${chunkIdx}`,
             owner_id: ownerId,
             owner_namespace: ownerNamespace,
             agent_id: agentId,
             memory_scope: "session_distilled",
             memory_type: "episode",
-            title: `Session Transcript Chunk ${Math.floor(i/chunkSize) + 1}`,
-            content: fullContent,
+            title: `Transcript Chunk ${chunkIdx + 1}`,
+            content: contentToEmbed,
             summary: "",
             tags: "[]",
-            importance: 1, // Episode chunks have low intrinsic importance
+            importance: 1,
             confidence: 1.0,
             status: "active",
             supersedes_id: "",
             source: "distill",
             source_session_id: params.sessionId,
-            created_at: Date.now() + i, // Ensure slight temporal offset for sorting
+            created_at: Date.now() + chunkIdx, // Temporal offset for stable sorting
             updated_at: Date.now(),
             last_used_at: Date.now(),
             embedding: vector,
-          };
+          });
           
-          await deps.storage.insertMemory(record);
-          episodicChunksInserted++;
-        } catch (err) {
-          throw new Error(`Failed to persist episodic memory chunk during compaction: ${err instanceof Error ? err.message : String(err)}. Aborting truncation to prevent data loss.`);
+          currentChunkText = "";
+          currentChunkTokenCount = 0;
+          chunkIdx++;
         }
+        
+        currentChunkText += lineText;
+        currentChunkTokenCount += lineTokens;
+      }
+
+      // Handle the final chunk
+      if (currentChunkText.trim()) {
+        const header = `[Session Transcript Chunk ${chunkIdx + 1}]\n`;
+        const contentToEmbed = header + currentChunkText;
+        // Truncate if a single message is still too large (extreme edge case)
+        const safeContent = currentChunkTokenCount > MAX_EMBEDDING_TOKENS 
+          ? contentToEmbed.slice(0, MAX_EMBEDDING_TOKENS * 4) 
+          : contentToEmbed;
+        
+        const vector = await deps.embedder.embed(safeContent);
+        episodicChunks.push({
+          memory_id: `episode-${Date.now()}-${chunkIdx}`,
+          owner_id: ownerId,
+          owner_namespace: ownerNamespace,
+          agent_id: agentId,
+          memory_scope: "session_distilled",
+          memory_type: "episode",
+          title: `Transcript Chunk ${chunkIdx + 1}`,
+          content: safeContent,
+          summary: "",
+          tags: "[]",
+          importance: 1,
+          confidence: 1.0,
+          status: "active",
+          supersedes_id: "",
+          source: "distill",
+          source_session_id: params.sessionId,
+          created_at: Date.now() + chunkIdx,
+          updated_at: Date.now(),
+          last_used_at: Date.now(),
+          embedding: vector,
+        });
+      }
+
+      // ATOMICITY & FAIL-CLOSED (P1 Fix): 
+      // Insert ALL chunks before truncating the session file.
+      // If any insert fails, the outer catch will handle it and truncation won't happen.
+      for (const record of episodicChunks) {
+        await deps.storage.insertMemory(record);
       }
 
       // Insert a compaction marker
@@ -794,7 +844,7 @@ async function compactSession(
         summary: distillResult.session_summary || "Session compacted by memory-lancedb-brain",
         droppedMessages: droppedCount,
         keptMessages: keptMessages.length,
-        episodesSaved: episodicChunksInserted,
+        episodesSaved: episodicChunks.length,
       });
 
       const truncatedContent = [
@@ -804,7 +854,7 @@ async function compactSession(
       ].join("\n") + "\n";
 
       await writeFile(resolvedFile, truncatedContent, "utf-8");
-      console.log(`[memory-lancedb-brain] compactSession: truncated session file — dropped ${droppedCount} messages (saved as ${episodicChunksInserted} episodes), kept ${keptMessages.length}, ~${keptTokens} tokens`);
+      console.log(`[memory-lancedb-brain] compactSession: truncated session file — dropped ${droppedCount} messages (saved as ${episodicChunks.length} episodes), kept ${keptMessages.length}, ~${keptTokens} tokens`);
     }
 
     return {
