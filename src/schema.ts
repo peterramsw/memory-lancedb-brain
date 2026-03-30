@@ -4,7 +4,7 @@
 
 // Memory record types
 export type MemoryScope = "owner_shared" | "agent_local" | "session_distilled";
-export type MemoryType = "fact" | "preference" | "decision" | "pitfall" | "status" | "todo" | "summary" | "correction" | "best_practice" | "goal";
+export type MemoryType = "fact" | "preference" | "decision" | "pitfall" | "status" | "todo" | "summary" | "correction" | "best_practice" | "goal" | "episode";
 export type MemoryStatus = "active" | "archived" | "superseded";
 export type MemoryEventType = "create" | "merge" | "promote" | "archive" | "supersede" | "recall" | "distill" | "consolidate" | "contradiction" | "profile_sync";
 

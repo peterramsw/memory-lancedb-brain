@@ -15,6 +15,7 @@ export interface MemoryFilters {
   memory_type?: MemoryType;
   status?: MemoryStatus;
   source?: string;
+  source_session_id?: string;
 }
 
 export interface MemoryTables {
@@ -42,6 +43,7 @@ function buildWhereClause(filters?: MemoryFilters): string | null {
   }
   if (filters.status) conditions.push(`status = '${escapeSqlLiteral(filters.status)}'`);
   if (filters.source) conditions.push(`source = '${escapeSqlLiteral(filters.source)}'`);
+  if (filters.source_session_id) conditions.push(`source_session_id = '${escapeSqlLiteral(filters.source_session_id)}'`);
 
   return conditions.length > 0 ? conditions.join(" AND ") : null;
 }
