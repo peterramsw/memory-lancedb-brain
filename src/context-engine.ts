@@ -154,6 +154,11 @@ const DEFAULT_AUTO_DISTILL: AutoDistillConfig = {
   onNew: true,
 };
 
+const EPISODE_MAX_CHUNKS = 3;
+const EPISODE_CHUNK_TOKEN_BUDGET = 1200;
+const EPISODE_LINE_TOKEN_BUDGET = EPISODE_CHUNK_TOKEN_BUDGET - 32;
+const EPISODE_RECALL_TOKEN_BUDGET = EPISODE_CHUNK_TOKEN_BUDGET * EPISODE_MAX_CHUNKS + 160;
+
 /**
  * Resolve owner from runtimeContext fields or fall back to deps.owners config.
  * This bridges the gap between what openclaw passes to context engine hooks
@@ -495,6 +500,59 @@ function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
 }
 
+function serializeEpisodeContent(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part: any) => {
+        if (part?.type === "text" && typeof part?.text === "string") return part.text;
+        return JSON.stringify(part);
+      })
+      .join(" ");
+  }
+  if (typeof content === "undefined") return "";
+  return JSON.stringify(content);
+}
+
+function splitTextByTokenBudget(text: string, maxTokens: number): string[] {
+  const normalized = text.trim();
+  if (!normalized) return [];
+
+  const maxChars = Math.max(64, maxTokens * 4);
+  const parts: string[] = [];
+  let remaining = normalized;
+
+  while (remaining.length > maxChars) {
+    let splitAt = remaining.lastIndexOf("\n", maxChars);
+    if (splitAt < maxChars / 2) splitAt = remaining.lastIndexOf(" ", maxChars);
+    if (splitAt < maxChars / 2) splitAt = maxChars;
+
+    parts.push(remaining.slice(0, splitAt).trim());
+    remaining = remaining.slice(splitAt).trimStart();
+  }
+
+  if (remaining) parts.push(remaining);
+  return parts;
+}
+
+function buildEpisodeSegments(rawLine: string): string[] {
+  try {
+    const parsed = JSON.parse(rawLine);
+    if (parsed.type !== "message") return [];
+
+    const role = parsed.message?.role || "unknown";
+    const normalized = serializeEpisodeContent(parsed.message?.content);
+    if (!normalized.trim()) return [];
+
+    const parts = splitTextByTokenBudget(normalized, EPISODE_LINE_TOKEN_BUDGET);
+    if (parts.length <= 1) return [`${role}: ${parts[0]}\n`];
+
+    return parts.map((part, index) => `${role} [part ${index + 1}/${parts.length}]: ${part}\n`);
+  } catch {
+    return splitTextByTokenBudget(rawLine, EPISODE_LINE_TOKEN_BUDGET).map((part) => `${part}\n`);
+  }
+}
+
 function buildRecallQuery(messages: AgentMessageLike[], session: SessionState): string {
   const userTurns = messages
     .filter((message) => String(message?.role ?? "").toLowerCase() === "user")
@@ -720,99 +778,27 @@ async function compactSession(
 
     const droppedCount = messageLines.length - keptMessages.length;
     if (droppedCount > 0) {
-      // Hardened Episodic Memory Persistence Logic (Validated via Logical Derivation)
       const droppedMessages = messageLines.slice(0, droppedCount);
       const episodicChunks: MemoryRecord[] = [];
-      const MAX_EMBEDDING_TOKENS = 6000; // Leave buffer for overhead (model limit is usually 8k)
-
       let currentChunkText = "";
       let currentChunkTokenCount = 0;
       let chunkIdx = 0;
 
-      for (let i = 0; i < droppedMessages.length; i++) {
-        let lineText = "";
-        try {
-          const parsed = JSON.parse(droppedMessages[i]);
-          if (parsed.type !== "message") continue;
-          
-          const role = parsed.message?.role || "unknown";
-          const content = parsed.message?.content;
-          
-          // Universal Serialization (P2 Fix): Preserve multimodal/tool data
-          const normalized = typeof content === "string"
-            ? content
-            : Array.isArray(content)
-              ? content.map((c: any) => {
-                  if (c?.type === "text") return c.text;
-                  return JSON.stringify(c); // Keep multimodal parts as JSON
-                }).join(" ")
-              : JSON.stringify(content); // Fallback for tool results/objects
-          
-          lineText = `${role}: ${normalized}\n`;
-        } catch {
-          lineText = droppedMessages[i] + "\n";
-        }
+      const flushEpisodeChunk = async (): Promise<void> => {
+        if (!currentChunkText.trim()) return;
 
-        const lineTokens = Math.ceil(lineText.length / 4);
-        
-        // Token-budget aware chunking (P1 Fix): Prevent embedding overflow
-        if (currentChunkTokenCount + lineTokens > MAX_EMBEDDING_TOKENS && currentChunkText.trim()) {
-          // Process current chunk before starting a new one
-          const header = `[Session Transcript Chunk ${chunkIdx + 1}]\n`;
-          const contentToEmbed = header + currentChunkText;
-          const vector = await deps.embedder.embed(contentToEmbed);
-          
-          episodicChunks.push({
-            memory_id: `episode-${Date.now()}-${chunkIdx}`,
-            owner_id: ownerId,
-            owner_namespace: ownerNamespace,
-            agent_id: agentId,
-            memory_scope: "session_distilled",
-            memory_type: "episode",
-            title: `Transcript Chunk ${chunkIdx + 1}`,
-            content: contentToEmbed,
-            summary: "",
-            tags: "[]",
-            importance: 1,
-            confidence: 1.0,
-            status: "active",
-            supersedes_id: "",
-            source: "distill",
-            source_session_id: params.sessionId,
-            created_at: Date.now() + chunkIdx, // Temporal offset for stable sorting
-            updated_at: Date.now(),
-            last_used_at: Date.now(),
-            embedding: vector,
-          });
-          
-          currentChunkText = "";
-          currentChunkTokenCount = 0;
-          chunkIdx++;
-        }
-        
-        currentChunkText += lineText;
-        currentChunkTokenCount += lineTokens;
-      }
-
-      // Handle the final chunk
-      if (currentChunkText.trim()) {
-        const header = `[Session Transcript Chunk ${chunkIdx + 1}]\n`;
-        const contentToEmbed = header + currentChunkText;
-        // Truncate if a single message is still too large (extreme edge case)
-        const safeContent = currentChunkTokenCount > MAX_EMBEDDING_TOKENS 
-          ? contentToEmbed.slice(0, MAX_EMBEDDING_TOKENS * 4) 
-          : contentToEmbed;
-        
-        const vector = await deps.embedder.embed(safeContent);
+        const now = Date.now();
+        const contentToEmbed = `[Session Transcript Chunk ${chunkIdx + 1}]\n${currentChunkText}`;
+        const vector = await deps.embedder.embed(contentToEmbed);
         episodicChunks.push({
-          memory_id: `episode-${Date.now()}-${chunkIdx}`,
+          memory_id: `episode-${now}-${chunkIdx}`,
           owner_id: ownerId,
           owner_namespace: ownerNamespace,
           agent_id: agentId,
           memory_scope: "session_distilled",
           memory_type: "episode",
           title: `Transcript Chunk ${chunkIdx + 1}`,
-          content: safeContent,
+          content: contentToEmbed,
           summary: "",
           tags: "[]",
           importance: 1,
@@ -821,12 +807,34 @@ async function compactSession(
           supersedes_id: "",
           source: "distill",
           source_session_id: params.sessionId,
-          created_at: Date.now() + chunkIdx,
-          updated_at: Date.now(),
-          last_used_at: Date.now(),
+          created_at: now + chunkIdx,
+          updated_at: now,
+          last_used_at: now,
           embedding: vector,
         });
+
+        currentChunkText = "";
+        currentChunkTokenCount = 0;
+        chunkIdx += 1;
+      };
+
+      for (let i = 0; i < droppedMessages.length; i++) {
+        for (const segment of buildEpisodeSegments(droppedMessages[i])) {
+          const segmentTokens = estimateTokens(segment);
+          if (currentChunkTokenCount + segmentTokens > EPISODE_CHUNK_TOKEN_BUDGET && currentChunkText.trim()) {
+            await flushEpisodeChunk();
+          }
+
+          if (segmentTokens > EPISODE_CHUNK_TOKEN_BUDGET) {
+            throw new Error(`Episode segment exceeded token budget after split (${segmentTokens} > ${EPISODE_CHUNK_TOKEN_BUDGET})`);
+          }
+
+          currentChunkText += segment;
+          currentChunkTokenCount += segmentTokens;
+        }
       }
+
+      await flushEpisodeChunk();
 
       // ATOMICITY & FAIL-CLOSED (P1 Fix): 
       // Insert ALL chunks before truncating the session file.
@@ -1088,10 +1096,10 @@ export function createMemoryBrainContextEngine(deps: ContextEngineDeps) {
           // 2. Then sort back to oldest-to-newest for rendering
           const sessionSpecificEpisodes = rawEpisodes
             .sort((a, b) => (b.created_at || 0) - (a.created_at || 0))
-            .slice(0, 3) // take the 3 most recent chunks
+            .slice(0, EPISODE_MAX_CHUNKS) // take the most recent bounded set
             .sort((a, b) => (a.created_at || 0) - (b.created_at || 0)); // restore natural timeline
           
-          sessionEpisodes = trimMemoriesByTokenBudget(sessionSpecificEpisodes, 1500); // Allow up to ~1500 tokens of raw history
+          sessionEpisodes = trimMemoriesByTokenBudget(sessionSpecificEpisodes, EPISODE_RECALL_TOKEN_BUDGET);
         } catch (err) {
           console.warn(`[memory-lancedb-brain] Failed to retrieve episode chunks: ${err instanceof Error ? err.message : String(err)}`);
         }

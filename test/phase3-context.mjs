@@ -357,6 +357,107 @@ test("Phase 3 regression: compact sanitizes transcript and respects distill toke
   }
 });
 
+test("Phase 3 regression: compact splits oversized dropped messages into multiple episode records without truncation", async () => {
+  const { dbPath, storage } = await setupStorage();
+  const sessionFile = `/tmp/memory-lancedb-brain-session-${randomUUID()}.jsonl`;
+  const headMarker = "LOSSLESS-HEAD-4411";
+  const tailMarker = "LOSSLESS-TAIL-9927";
+  const oversized = `${headMarker} ${"tool-output ".repeat(2500)} ${tailMarker}`;
+
+  try {
+    await writeFile(
+      sessionFile,
+      [
+        JSON.stringify({ type: "message", message: { role: "user", content: oversized } }),
+        JSON.stringify({ type: "message", message: { role: "assistant", content: "Recent reply that should remain in the trimmed session file." } }),
+      ].join("\n"),
+      "utf8",
+    );
+
+    const deps = createDeps(storage);
+    deps.sessionStates.set("lossless-split", {
+      sessionId: "lossless-split",
+      sessionKey: "key-lossless-split",
+      agentId: "main",
+      owner: { ownerId: "test-user", ownerNamespace: "personal" },
+      channelId: "telegram",
+      sessionFile,
+      staging: ["Need to preserve the full tool output across compaction."],
+      childSessionKeys: [],
+      updatedAt: Date.now(),
+    });
+
+    const engine = createMemoryBrainContextEngine(deps);
+    const compactResult = await engine.compact({ sessionId: "lossless-split", sessionFile, force: true, currentTokenCount: 2000 });
+    assert.strictEqual(compactResult.ok, true);
+    assert.strictEqual(compactResult.compacted, true);
+
+    const episodes = (await storage.queryMemoriesByFilter({
+      owner_id: "test-user",
+      owner_namespace: "personal",
+      memory_type: "episode",
+      source_session_id: "lossless-split",
+      status: "active",
+    })).sort((a, b) => (a.created_at || 0) - (b.created_at || 0));
+
+    assert.ok(episodes.length > 1, "oversized dropped message should be split into multiple episode rows");
+
+    const joinedEpisodeContent = episodes.map((memory) => memory.content).join("\n");
+    assert.match(joinedEpisodeContent, new RegExp(headMarker));
+    assert.match(joinedEpisodeContent, new RegExp(tailMarker));
+  } finally {
+    await safeRm(dbPath);
+    await safeRm(sessionFile);
+  }
+});
+
+test("Phase 3 regression: assemble recalls stored episode chunks after compaction", async () => {
+  const { dbPath, storage } = await setupStorage();
+  const sessionFile = `/tmp/memory-lancedb-brain-session-${randomUUID()}.jsonl`;
+  const recallMarker = "EPISODE-RECALL-5518";
+  const oversized = `${"continuity ".repeat(1800)} ${recallMarker} recall-tail`;
+
+  try {
+    await writeFile(
+      sessionFile,
+      [
+        JSON.stringify({ type: "message", message: { role: "user", content: oversized } }),
+        JSON.stringify({ type: "message", message: { role: "assistant", content: "Latest assistant turn should remain after compaction." } }),
+      ].join("\n"),
+      "utf8",
+    );
+
+    const deps = createDeps(storage);
+    deps.sessionStates.set("episode-recall", {
+      sessionId: "episode-recall",
+      sessionKey: "key-episode-recall",
+      agentId: "main",
+      owner: { ownerId: "test-user", ownerNamespace: "personal" },
+      channelId: "telegram",
+      sessionFile,
+      staging: ["We need to continue the earlier compacted context."],
+      childSessionKeys: [],
+      updatedAt: Date.now(),
+    });
+
+    const engine = createMemoryBrainContextEngine(deps);
+    const compactResult = await engine.compact({ sessionId: "episode-recall", sessionFile, force: true, currentTokenCount: 2000 });
+    assert.strictEqual(compactResult.ok, true);
+    assert.strictEqual(compactResult.compacted, true);
+
+    const assembleResult = await engine.assemble({
+      sessionId: "episode-recall",
+      messages: [{ role: "user", content: `Can you continue from ${recallMarker}?` }],
+    });
+
+    assert.match(assembleResult.systemPromptAddition, /Relevant_Past_Context/);
+    assert.match(assembleResult.systemPromptAddition, new RegExp(recallMarker));
+  } finally {
+    await safeRm(dbPath);
+    await safeRm(sessionFile);
+  }
+});
+
 test("Phase 3 regression: heuristic fallback preserves operational fact and blocks startup pollution", async () => {
   const { dbPath, storage } = await setupStorage();
   const sessionFile = `/tmp/memory-lancedb-brain-session-${randomUUID()}.jsonl`;
