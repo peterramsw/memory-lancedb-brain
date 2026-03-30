@@ -496,6 +496,21 @@ function trimMemoriesByTokenBudget(memories: MemoryRecord[], budget: number): Me
   return result;
 }
 
+function trimLatestMemoriesByTokenBudget(memories: MemoryRecord[], budget: number): MemoryRecord[] {
+  let totalTokens = 0;
+  const result: MemoryRecord[] = [];
+
+  for (let i = memories.length - 1; i >= 0; i -= 1) {
+    const mem = memories[i];
+    const tokens = Math.ceil(mem.content.length / 4);
+    if (totalTokens + tokens > budget) break;
+    totalTokens += tokens;
+    result.unshift(mem);
+  }
+
+  return result;
+}
+
 function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
 }
@@ -1097,7 +1112,7 @@ export function createMemoryBrainContextEngine(deps: ContextEngineDeps) {
           const sessionSpecificEpisodes = rawEpisodes
             .sort((a, b) => (a.created_at || 0) - (b.created_at || 0));
           
-          sessionEpisodes = trimMemoriesByTokenBudget(sessionSpecificEpisodes, EPISODE_RECALL_TOKEN_BUDGET);
+          sessionEpisodes = trimLatestMemoriesByTokenBudget(sessionSpecificEpisodes, EPISODE_RECALL_TOKEN_BUDGET);
         } catch (err) {
           console.warn(`[memory-lancedb-brain] Failed to retrieve episode chunks: ${err instanceof Error ? err.message : String(err)}`);
         }

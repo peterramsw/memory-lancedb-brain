@@ -416,7 +416,7 @@ test("Phase 3 regression: assemble recalls stored episode chunks after compactio
   const { dbPath, storage } = await setupStorage();
   const sessionFile = `/tmp/memory-lancedb-brain-session-${randomUUID()}.jsonl`;
   const recallMarker = "EPISODE-RECALL-5518";
-  const oversized = `${recallMarker} ${"continuity ".repeat(1800)} recall-tail`;
+  const oversized = `${"continuity ".repeat(1800)} ${recallMarker} recall-tail`;
 
   try {
     await writeFile(
@@ -453,6 +453,55 @@ test("Phase 3 regression: assemble recalls stored episode chunks after compactio
 
     assert.match(assembleResult.systemPromptAddition, /Relevant_Past_Context/);
     assert.match(assembleResult.systemPromptAddition, new RegExp(recallMarker));
+  } finally {
+    await safeRm(dbPath);
+    await safeRm(sessionFile);
+  }
+});
+
+test("Phase 3 regression: assemble prioritizes newest episode chunks within recall budget", async () => {
+  const { dbPath, storage } = await setupStorage();
+  const sessionFile = `/tmp/memory-lancedb-brain-session-${randomUUID()}.jsonl`;
+  const oldestMarker = "EPISODE-OLD-1102";
+  const newestMarker = "EPISODE-NEW-8834";
+  const oversized = `${oldestMarker} ${"continuity ".repeat(900)} middle-span ${"continuity ".repeat(900)} ${newestMarker}`;
+
+  try {
+    await writeFile(
+      sessionFile,
+      [
+        JSON.stringify({ type: "message", message: { role: "user", content: oversized } }),
+        JSON.stringify({ type: "message", message: { role: "assistant", content: "Latest assistant turn should remain after compaction." } }),
+      ].join("\n"),
+      "utf8",
+    );
+
+    const deps = createDeps(storage);
+    deps.sessionStates.set("episode-recall-latest", {
+      sessionId: "episode-recall-latest",
+      sessionKey: "key-episode-recall-latest",
+      agentId: "main",
+      owner: { ownerId: "test-user", ownerNamespace: "personal" },
+      channelId: "telegram",
+      sessionFile,
+      staging: ["We need the most recent compacted context, not the oldest slice."],
+      childSessionKeys: [],
+      updatedAt: Date.now(),
+    });
+
+    const engine = createMemoryBrainContextEngine(deps);
+    const compactResult = await engine.compact({ sessionId: "episode-recall-latest", sessionFile, force: true, currentTokenCount: 2000 });
+    assert.strictEqual(compactResult.ok, true);
+    assert.strictEqual(compactResult.compacted, true);
+
+    const assembleResult = await engine.assemble({
+      sessionId: "episode-recall-latest",
+      messages: [{ role: "user", content: `Continue from ${newestMarker}.` }],
+    });
+
+    assert.match(assembleResult.systemPromptAddition, /Relevant_Past_Context/);
+    assert.match(assembleResult.systemPromptAddition, new RegExp(newestMarker));
+    assert.doesNotMatch(assembleResult.systemPromptAddition, new RegExp(oldestMarker));
   } finally {
     await safeRm(dbPath);
     await safeRm(sessionFile);
